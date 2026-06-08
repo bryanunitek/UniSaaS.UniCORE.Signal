@@ -1,47 +1,60 @@
-Signal-Server
-=================
+# UniSaaS.UniCORE.Signal
 
-Documentation
--------------
+**SCAFFOLD-ANCHOR repository — initial scaffold 2026-06-04.**
 
-Looking for protocol documentation? Check out the website!
+Full scaffolding, upstream-fork integration, and source-code work all pending a fresh dedicated kickoff arc. This initial commit exists to lock the repository's identity, licence position, and place in the UniCORE Sanity Check fleet so the work cannot be forgotten.
 
-https://signal.org/docs/
+Author: **Bryan Fred, Unitek Systems Limited, Bedford, United Kingdom.**
+First commit: **2026-06-04 16:45 UTC.**
 
-How to Build
-------------
+---
 
-This project uses [FoundationDB](https://www.foundationdb.org/) and requires the FoundationDB client library to be installed on the host system. With that in place, the server can be built and tested with:
+## What this repository is
 
-```shell script
-$ ./mvnw clean test
-```
+`bryanunitek/UniSaaS.UniCORE.Signal` is the **Signal** family member: SaaS-deployment-shape public gift surface. Documentation today; source code at certification.
 
-Security
---------
+**Family purpose:** Open-source secure messaging server. End-to-end encrypted messaging with on-premise deployment capability for law-firm-grade secure communications.
 
-Security issues should be sent to <a href=mailto:security@signal.org>security@signal.org</a>.
+**Role in UniCORE:** Secure messaging substrate — UniCORE.GVB substrate-services explore Signal-Server deployments for enterprise-grade secure communications where data sovereignty requires messages to never leave customer-controlled infrastructure.
 
-Help
-----
+**Deployment shape:** This is the **SaaS-shape** member of the family. It tracks the same upstream codebase as [`UniCORE.Signal`](https://github.com/bryanunitek/UniCORE.Signal) (on-prem shape) but carries SaaS-specific configuration, multi-tenant isolation patterns, and cloud-native deployment artefacts.
 
-We cannot provide direct technical support. Get help running this software in your own environment in our [unofficial community forum][community forum].
+---
 
-Cryptography Notice
--------------------
+## Upstream
 
-This distribution includes cryptographic software. The country in which you currently reside may have restrictions on the import, possession, use, and/or re-export to another country, of encryption software.
-BEFORE using any encryption software, please check your country's laws, regulations and policies concerning the import, possession, or use, and re-export of encryption software, to see if this is permitted.
-See <https://www.wassenaar.org/> for more information.
+- **Upstream project:** [https://github.com/signalapp/Signal-Server](https://github.com/signalapp/Signal-Server)
+- **Upstream licence:** AGPL-3.0
+- **Our relationship:** Fork-and-extend. Upstream codebase consumed verbatim; our code additions carry AGPL-3.0; our documentation additions under CC BY 4.0.
 
-The U.S. Government Department of Commerce, Bureau of Industry and Security (BIS), has classified this software as Export Commodity Control Number (ECCN) 5D002.C.1, which includes information security software using or performing cryptographic functions with asymmetric algorithms.
-The form and manner of this distribution makes it eligible for export under the License Exception ENC Technology Software Unrestricted (TSU) exception (see the BIS Export Administration Regulations, Section 740.13) for both object code and source code.
+---
 
-License
--------
+## Platforms
 
-Copyright 2013 Signal Messenger, LLC
+Windows · Linux · macOS · iOS · Android
 
-Licensed under the GNU AGPLv3: https://www.gnu.org/licenses/agpl-3.0.html
+---
 
-[community forum]: https://community.signalusers.org
+## Family — the four-repo pattern
+
+- [`UniCORE.Signal`](https://github.com/bryanunitek/UniCORE.Signal) — public on-prem-deployment-shape gift surface
+- `bryanunitek/UniSaaS.UniCORE.Signal` — public SaaS-deployment-shape gift surface ← **this repo**
+- `bryanunitek/UniCORE.Signal-Claw` (private) — on-prem-shape working repository
+- `bryanunitek/UniSaaS.UniCORE.Signal-Claw` (private) — SaaS-shape working repository
+
+---
+
+## Status
+
+**SCAFFOLD-ANCHOR** as of 2026-06-04. See [`STATUS.md`](STATUS.md).
+
+---
+
+## Contact
+
+- **Public discussion:** [GitHub Discussions](https://github.com/bryanunitek/UniSaaS.UniCORE.Signal/discussions)
+- **Private contact:** [LinkedIn — Bryan Fred](https://www.linkedin.com/in/bryan-fred-02209753/)
+
+---
+
+*Author: Bryan Fred, Unitek Systems Limited, Bedford, United Kingdom. Public. Given, not sold. Irrevocable.*
