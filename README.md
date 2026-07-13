@@ -17,7 +17,7 @@ First commit: **2026-06-04 16:45 UTC.**
 
 **Role in UniCORE:** Secure messaging substrate — UniCORE.GVB substrate-services explore Signal-Server deployments for enterprise-grade secure communications where data sovereignty requires messages to never leave customer-controlled infrastructure.
 
-**Deployment shape:** This is the **SaaS-shape** member of the family. It tracks the same upstream codebase as [`UniCORE.Signal`](https://github.com/bryanunitek/UniCORE.Signal) (on-prem shape) but carries SaaS-specific configuration, multi-tenant isolation patterns, and cloud-native deployment artefacts.
+**Deployment shape:** This is the **SaaS-shape** member of the family. It tracks the same upstream codebase as [`UniCORE.Signal`](https://git.unitek-systems.com/UniCORE/UniCORE.Signal) (mirror: [GitHub](https://github.com/bryanunitek/UniCORE.Signal)) (on-prem shape) but carries SaaS-specific configuration, multi-tenant isolation patterns, and cloud-native deployment artefacts.
 
 ---
 
@@ -37,7 +37,7 @@ Windows · Linux · macOS · iOS · Android
 
 ## Family — the four-repo pattern
 
-- [`UniCORE.Signal`](https://github.com/bryanunitek/UniCORE.Signal) — public on-prem-deployment-shape gift surface
+- [`UniCORE.Signal`](https://git.unitek-systems.com/UniCORE/UniCORE.Signal) (mirror: [GitHub](https://github.com/bryanunitek/UniCORE.Signal)) — public on-prem-deployment-shape gift surface
 - `bryanunitek/UniSaaS.UniCORE.Signal` — public SaaS-deployment-shape gift surface ← **this repo**
 - `bryanunitek/UniCORE.Signal-Claw` (private) — on-prem-shape working repository
 - `bryanunitek/UniSaaS.UniCORE.Signal-Claw` (private) — SaaS-shape working repository
