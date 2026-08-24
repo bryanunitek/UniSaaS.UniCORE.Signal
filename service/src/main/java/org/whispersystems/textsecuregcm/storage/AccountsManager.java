@@ -8,6 +8,8 @@ package org.whispersystems.textsecuregcm.storage;
 import static java.util.Objects.requireNonNull;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
+import com.eatthepath.otp.HmacOneTimePasswordGenerator;
+import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import com.google.common.annotations.VisibleForTesting;
@@ -38,6 +40,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -51,14 +54,18 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import javax.annotation.Nullable;
+import javax.crypto.KeyGenerator;
 import javax.crypto.Mac;
+import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
 import org.apache.commons.lang3.StringUtils;
 import org.signal.libsignal.protocol.IdentityKey;
@@ -74,7 +81,6 @@ import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.RestoreAccountRequest;
 import org.whispersystems.textsecuregcm.entities.TransferArchiveResult;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantPubSubConnection;
@@ -83,6 +89,7 @@ import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
 import org.whispersystems.textsecuregcm.securestorage.SecureStorageClient;
 import org.whispersystems.textsecuregcm.securevaluerecovery.SecureValueRecoveryClient;
 import org.whispersystems.textsecuregcm.util.ExceptionUtils;
+import org.whispersystems.textsecuregcm.util.NoStackTraceRuntimeException;
 import org.whispersystems.textsecuregcm.util.Pair;
 import org.whispersystems.textsecuregcm.util.RegistrationIdValidator;
 import org.whispersystems.textsecuregcm.util.ResilienceUtil;
@@ -141,6 +148,10 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   private final ScheduledExecutorService messagesPollExecutor;
   private final ScheduledExecutorService retryExecutor;
   private final Clock clock;
+  private final Duration maxTotpValidationDelay;
+
+  private final KeyGenerator totpKeyGenerator;
+  private final TimeBasedOneTimePasswordGenerator totpGenerator;
 
   private final Key verificationTokenKey;
 
@@ -195,6 +206,17 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   @VisibleForTesting
   static final String LINK_DEVICE_VERIFICATION_TOKEN_ALGORITHM = "HmacSHA256";
 
+  @VisibleForTesting
+  static final int TOTP_KEY_LENGTH_BITS = 256;
+
+  @VisibleForTesting
+  public static final TotpParameters TOTP_PARAMETERS = new TotpParameters(
+      TimeBasedOneTimePasswordGenerator.TOTP_ALGORITHM_HMAC_SHA256,
+      HmacOneTimePasswordGenerator.DEFAULT_PASSWORD_LENGTH,
+      TimeBasedOneTimePasswordGenerator.DEFAULT_TIME_STEP);
+
+  public static final int MAX_TOTP_KEYS = 2;
+
   public enum DeletionReason {
     ADMIN_DELETED("admin"),
     EXPIRED      ("expired"),
@@ -207,8 +229,63 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     }
   }
 
+  private enum AccountCreationType {
+    NEW("new"),
+    RECENTLY_DELETED("recently-deleted"),
+    RE_REGISTRATION("re-registration");
+
+    private final String tagValue;
+
+    AccountCreationType(final String tagValue) {
+      this.tagValue = tagValue;
+    }
+
+    public String getTagValue() {
+      return tagValue;
+    }
+  }
+
+  private enum PushTokenType {
+    APNS("apns"),
+    FCM("fcm"),
+    NONE("none");
+
+    private final String tagValue;
+
+    PushTokenType(final String tagValue) {
+      this.tagValue = tagValue;
+    }
+
+    public String getTagValue() {
+      return tagValue;
+    }
+
+    public static PushTokenType fromDeviceSpec(final DeviceSpec deviceSpec) {
+      if (deviceSpec.apnRegistrationId().isPresent()) {
+        return PushTokenType.APNS;
+      } else if (deviceSpec.gcmRegistrationId().isPresent()) {
+        return PushTokenType.FCM;
+      } else {
+        return PushTokenType.NONE;
+      }
+    }
+
+    public static PushTokenType fromDevice(final Device device) {
+      if (StringUtils.isNotBlank(device.getApnId())) {
+        return PushTokenType.APNS;
+      } else if (StringUtils.isNotBlank(device.getGcmId())) {
+        return PushTokenType.FCM;
+      } else {
+        return PushTokenType.NONE;
+      }
+    }
+  }
+
   private record DeviceIdentifier(UUID accountIdentifier, byte deviceId,
                                   int registrationId) {
+  }
+
+  private static class UncheckedTooManyTotpKeysException extends NoStackTraceRuntimeException {
   }
 
   public AccountsManager(final Accounts accounts,
@@ -218,15 +295,18 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final AccountLockManager accountLockManager,
       final KeysManager keysManager,
       final MessagesManager messagesManager,
-      final ProfilesManager profilesManager, final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager,
+      final ProfilesManager profilesManager,
+      final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager,
       final SecureStorageClient secureStorageClient,
       final SecureValueRecoveryClient secureValueRecovery2Client,
       final DisconnectionRequestManager disconnectionRequestManager,
       final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager,
       final Executor accountLockExecutor,
-      final ScheduledExecutorService messagesPollExecutor, final ScheduledExecutorService retryExecutor,
+      final ScheduledExecutorService messagesPollExecutor,
+      final ScheduledExecutorService retryExecutor,
       final Clock clock,
-      final byte[] linkDeviceSecret) {
+      final byte[] linkDeviceSecret,
+      final Duration maxTotpValidationDelay) {
     this.accounts = accounts;
     this.phoneNumberIdentifiers = phoneNumberIdentifiers;
     this.cacheCluster = cacheCluster;
@@ -245,6 +325,12 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     this.retryExecutor = retryExecutor;
     this.clock = requireNonNull(clock);
 
+    if (maxTotpValidationDelay.compareTo(TOTP_PARAMETERS.timeStep()) > 0) {
+      throw new IllegalArgumentException("Max TOTP validation delay must be less than or equal to TOTP time step");
+    }
+
+    this.maxTotpValidationDelay = maxTotpValidationDelay;
+
     this.verificationTokenKey = new SecretKeySpec(linkDeviceSecret, LINK_DEVICE_VERIFICATION_TOKEN_ALGORITHM);
 
     // Fail fast: reject bad keys
@@ -252,6 +338,21 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       getInitializedMac(verificationTokenKey);
     } catch (final InvalidKeyException e) {
       throw new IllegalArgumentException(e);
+    }
+
+    try {
+      this.totpKeyGenerator = KeyGenerator.getInstance(TOTP_PARAMETERS.algorithm());
+      totpKeyGenerator.init(TOTP_KEY_LENGTH_BITS);
+    } catch (final NoSuchAlgorithmException e) {
+      throw new AssertionError("Every implementation of the Java platform is required to support the HmacSHA256 KeyGenerator algorithm", e);
+    }
+
+    try {
+      this.totpGenerator = new TimeBasedOneTimePasswordGenerator(TOTP_PARAMETERS.timeStep(),
+          TOTP_PARAMETERS.passwordLength(),
+          TOTP_PARAMETERS.algorithm());
+    } catch (final NoSuchAlgorithmException e) {
+      throw new AssertionError("Every implementation of the Java platform is required to support the HmacSHA256 MAC algorithm", e);
     }
 
     this.pubSubConnection = pubSubRedisClient.createPubSubConnection();
@@ -399,23 +500,17 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
     accountAttributes.recoveryPassword().ifPresent(account::setAccountRecoveryPassword);
 
-    String accountCreationType = maybeRecentlyDeletedAccountIdentifier.isPresent() ? "recently-deleted" : "new";
+    AccountCreationType accountCreationType = maybeRecentlyDeletedAccountIdentifier.isPresent()
+        ? AccountCreationType.RECENTLY_DELETED
+        : AccountCreationType.NEW;
 
-    final String pushTokenType;
+    final PushTokenType pushTokenType = PushTokenType.fromDeviceSpec(primaryDeviceSpec);
 
-    if (primaryDeviceSpec.apnRegistrationId().isPresent()) {
-      pushTokenType = "apns";
-    } else if (primaryDeviceSpec.gcmRegistrationId().isPresent()) {
-      pushTokenType = "fcm";
-    } else {
-      pushTokenType = "none";
-    }
-
-    String previousPushTokenType = null;
+    @Nullable PushTokenType previousPushTokenType = null;
 
     try {
       final List<TransactWriteItem> additionalWriteItems = new ArrayList<>(keysManager.buildWriteItemsForNewDevice(account.getAccountIdentifier(),
-          account.getPhoneNumberIdentifierOptional(),
+          account.getPhoneNumberIdentifier(),
           Device.PRIMARY_ID,
           primaryDeviceSpec.aciInfo().signedPreKey(),
           primaryDeviceSpec.pniInfo().map(DeviceIdentityInfo::signedPreKey),
@@ -436,81 +531,169 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
             additionalWriteItems);
       }
     } catch (final AccountAlreadyExistsException e) {
-      accountCreationType = "re-registration";
+      accountCreationType = AccountCreationType.RE_REGISTRATION;
+      previousPushTokenType = PushTokenType.fromDevice(e.getExistingAccount().getPrimaryDevice());
 
-      if (StringUtils.isNotBlank(e.getExistingAccount().getPrimaryDevice().getApnId())) {
-        previousPushTokenType = "apns";
-      } else if (StringUtils.isNotBlank(e.getExistingAccount().getPrimaryDevice().getGcmId())) {
-        previousPushTokenType = "fcm";
+      reclaimAccount(account, e.getExistingAccount(), primaryDeviceSpec, accountAttributes);
+    }
+
+    handleAccountCreated(account,
+        accountCreationType,
+        pushTokenType,
+        previousPushTokenType,
+        accountAttributes.recoveryPassword().isPresent(),
+        userAgent);
+
+    return account;
+  }
+
+  /// Recovers (re-registers) an account with a specific identifier. Callers are responsible for checking that the end
+  /// user has permission to recover the account (i.e. via an account recovery password).
+  ///
+  /// @param existingAccount the account to recover
+  /// @param accountAttributes a new set of attributes for the recovered account
+  /// @param aciIdentityKey a new identity key for the recovered account
+  /// @param maybePniIdentityKey a new PNI-associated identity for the recovered account; must be present if
+  ///                            `existingAccount` has a phone number
+  /// @param primaryDeviceSpec a new device spec for the account's primary device
+  /// @param userAgent the User-Agent string of the client requesting account reclamation
+  ///
+  /// @return the recovered [Account]
+  ///
+  /// @throws IllegalArgumentException if `maybePniIdentityKey` is set but the `existingAccount` does not have a phone
+  /// number or vice versa
+  @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
+  public Account recover(final Account existingAccount,
+      final AccountAttributes accountAttributes,
+      final IdentityKey aciIdentityKey,
+      final Optional<IdentityKey> maybePniIdentityKey,
+      final DeviceSpec primaryDeviceSpec,
+      @Nullable final String userAgent) {
+
+    final Account recoveredAccount = accountLockManager.withSingleAccountLock(existingAccount, () -> {
+      final Account account = new Account();
+      account.setAccountIdentifier(existingAccount.getAccountIdentifier());
+
+      if (existingAccount.getNumber().isPresent()) {
+        account.setNumber(existingAccount.getNumber().get(),
+            existingAccount.getPhoneNumberIdentifier()
+                .orElseThrow(() -> new AssertionError("Accounts that have a phone number must also have a PNI")));
+
+        account.setPhoneNumberIdentityKey(maybePniIdentityKey
+            .orElseThrow(() -> new IllegalArgumentException("PNI identity key must be provided if existing account has a phone number")));
+
+        account.setRegistrationLockFromAttributes(accountAttributes);
+        account.setDiscoverableByPhoneNumber(accountAttributes.isDiscoverableByPhoneNumber());
       } else {
-        previousPushTokenType = "none";
+        if (maybePniIdentityKey.isPresent()) {
+          throw new IllegalArgumentException("PNI identity key must not be provided if existing account does not have a phone number");
+        }
+
+        final byte[] authCredentialSalt = new byte[AUTH_CREDENTIAL_SALT_SIZE];
+        SECURE_RANDOM.nextBytes(authCredentialSalt);
+
+        account.setAuthCredentialSalt(authCredentialSalt);
       }
 
-      final UUID aci = e.getExistingAccount().getAccountIdentifier();
-      account.setAccountIdentifier(aci);
+      account.setIdentityKey(aciIdentityKey);
+      account.addDevice(primaryDeviceSpec.toDevice(Device.PRIMARY_ID, clock, aciIdentityKey));
+      account.setUnidentifiedAccessKey(accountAttributes.getUnidentifiedAccessKey());
+      account.setUnrestrictedUnidentifiedAccess(accountAttributes.isUnrestrictedUnidentifiedAccess());
+      account.setAccountRecoveryPassword(accountAttributes.recoveryPassword().orElseThrow(() ->
+          new IllegalArgumentException("Must specify a recovery password when reclaiming an existing account")));
 
-      final List<TransactWriteItem> additionalWriteItems = new ArrayList<>(keysManager.buildWriteItemsForNewDevice(account.getAccountIdentifier(),
-          account.getPhoneNumberIdentifierOptional(),
-          Device.PRIMARY_ID,
-          primaryDeviceSpec.aciInfo().signedPreKey(),
-          primaryDeviceSpec.pniInfo().map(DeviceIdentityInfo::signedPreKey),
-          primaryDeviceSpec.aciInfo().pqLastResortPreKey(),
-          primaryDeviceSpec.pniInfo().map(DeviceIdentityInfo::pqLastResortPreKey)));
+      reclaimAccount(account, existingAccount, primaryDeviceSpec, accountAttributes);
 
-      e.getExistingAccount().getDevices()
-          .stream()
-          .map(Device::getId)
-          // No need to clear the keys for the primary device since we'll just overwrite them in the same
-          // transaction anyhow
-          .filter(existingDeviceId -> existingDeviceId != Device.PRIMARY_ID)
-          .map(existingDeviceId ->
-              keysManager.buildWriteItemsForRemovedDevice(aci, account.getPhoneNumberIdentifierOptional(), existingDeviceId))
-          .forEach(additionalWriteItems::addAll);
+      return account;
+    }, accountLockExecutor);
 
-      maybePni.ifPresent(phoneNumberIdentifier ->
-          accountAttributes.recoveryPassword().ifPresent(phoneNumberRecoveryPassword ->
-              additionalWriteItems.add(phoneNumberRecoveryPasswordsManager.buildTransactWriteItemForStorePassword(phoneNumberIdentifier, phoneNumberRecoveryPassword))));
+    final PushTokenType pushTokenType = PushTokenType.fromDeviceSpec(primaryDeviceSpec);
+    final PushTokenType previousPushTokenType = PushTokenType.fromDevice(existingAccount.getPrimaryDevice());
 
-      CompletableFuture.allOf(
-              keysManager.deleteSingleUsePreKeys(aci),
-              account.getPhoneNumberIdentifierOptional().map(keysManager::deleteSingleUsePreKeys).orElse(CompletableFuture.completedFuture(null)),
+    handleAccountCreated(recoveredAccount,
+        AccountCreationType.RE_REGISTRATION,
+        pushTokenType,
+        previousPushTokenType,
+        true,
+        userAgent);
+
+    return recoveredAccount;
+  }
+
+  private void reclaimAccount(final Account account,
+      final Account existingAccount,
+      final DeviceSpec primaryDeviceSpec,
+      final AccountAttributes accountAttributes) {
+
+    final UUID aci = existingAccount.getAccountIdentifier();
+    account.setAccountIdentifier(aci);
+
+    final List<TransactWriteItem> additionalWriteItems = new ArrayList<>(keysManager.buildWriteItemsForNewDevice(account.getAccountIdentifier(),
+        account.getPhoneNumberIdentifier(),
+        Device.PRIMARY_ID,
+        primaryDeviceSpec.aciInfo().signedPreKey(),
+        primaryDeviceSpec.pniInfo().map(DeviceIdentityInfo::signedPreKey),
+        primaryDeviceSpec.aciInfo().pqLastResortPreKey(),
+        primaryDeviceSpec.pniInfo().map(DeviceIdentityInfo::pqLastResortPreKey)));
+
+    existingAccount.getDevices()
+        .stream()
+        .map(Device::getId)
+        // No need to clear the keys for the primary device since we'll just overwrite them in the same
+        // transaction anyhow
+        .filter(existingDeviceId -> existingDeviceId != Device.PRIMARY_ID)
+        .map(existingDeviceId ->
+            keysManager.buildWriteItemsForRemovedDevice(aci, account.getPhoneNumberIdentifier(), existingDeviceId))
+        .forEach(additionalWriteItems::addAll);
+
+    account.getPhoneNumberIdentifier().ifPresent(phoneNumberIdentifier ->
+        accountAttributes.recoveryPassword().ifPresent(phoneNumberRecoveryPassword ->
+            additionalWriteItems.add(phoneNumberRecoveryPasswordsManager.buildTransactWriteItemForStorePassword(phoneNumberIdentifier, phoneNumberRecoveryPassword))));
+
+    CompletableFuture.allOf(
+            keysManager.deleteSingleUsePreKeys(aci),
+            account.getPhoneNumberIdentifier().map(keysManager::deleteSingleUsePreKeys).orElse(CompletableFuture.completedFuture(null)),
+            messagesManager.clear(aci),
+            profilesManager.deleteAll(aci, false))
+        .thenCompose(ignored -> disconnectionRequestManager.requestDisconnection(existingAccount))
+        .thenCompose(ignored -> accounts.reclaimAccount(existingAccount, account, additionalWriteItems))
+        .thenCompose(ignored -> {
+          // We should have cleared all messages before overwriting the old account, but more may have arrived
+          // while we were working. Similarly, the old account holder could have added keys or profiles. We'll
+          // largely repeat the cleanup process after creating the account to make sure we really REALLY got
+          // everything.
+          //
+          // We exclude the primary device's repeated-use keys from deletion because new keys were provided as
+          // part of the account creation process, and we don't want to delete the keys that just got added.
+          return CompletableFuture.allOf(keysManager.deleteSingleUsePreKeys(aci),
+              account.getPhoneNumberIdentifier().map(keysManager::deleteSingleUsePreKeys).orElse(CompletableFuture.completedFuture(null)),
               messagesManager.clear(aci),
-              profilesManager.deleteAll(aci, false))
-          .thenCompose(ignored -> disconnectionRequestManager.requestDisconnection(e.getExistingAccount()))
-          .thenCompose(ignored -> accounts.reclaimAccount(e.getExistingAccount(), account, additionalWriteItems))
-          .thenCompose(ignored -> {
-            // We should have cleared all messages before overwriting the old account, but more may have arrived
-            // while we were working. Similarly, the old account holder could have added keys or profiles. We'll
-            // largely repeat the cleanup process after creating the account to make sure we really REALLY got
-            // everything.
-            //
-            // We exclude the primary device's repeated-use keys from deletion because new keys were provided as
-            // part of the account creation process, and we don't want to delete the keys that just got added.
-            return CompletableFuture.allOf(keysManager.deleteSingleUsePreKeys(aci),
-                account.getPhoneNumberIdentifierOptional().map(keysManager::deleteSingleUsePreKeys).orElse(CompletableFuture.completedFuture(null)),
-                messagesManager.clear(aci),
-                profilesManager.deleteAll(aci, false));
-          })
-          .join();
-    }
+              profilesManager.deleteAll(aci, false));
+        })
+        .join();
+  }
+
+  private void handleAccountCreated(final Account account,
+      final AccountCreationType accountCreationType,
+      final PushTokenType pushTokenType,
+      @Nullable final PushTokenType previousPushTokenType,
+      final boolean hasRecoveryPassword,
+      @Nullable final String userAgent) {
 
     redisSet(account);
 
     changeNumberWaitingPeriodManager.handleAccountCreated(account.getAccountIdentifier(), clock.instant());
 
     Tags tags = Tags.of(UserAgentTagUtil.getPlatformTag(userAgent),
-        Tag.of("type", accountCreationType),
-        Tag.of("hasPushToken", String.valueOf(
-            primaryDeviceSpec.apnRegistrationId().isPresent() || primaryDeviceSpec.gcmRegistrationId()
-                .isPresent())),
-        Tag.of("pushTokenType", pushTokenType),
-        Tag.of("hasRecoveryPassword", String.valueOf(accountAttributes.recoveryPassword().isPresent())));
+        Tag.of("type", accountCreationType.getTagValue()),
+        Tag.of("pushTokenType", pushTokenType.getTagValue()),
+        Tag.of("hasRecoveryPassword", String.valueOf(hasRecoveryPassword)));
 
-    if (StringUtils.isNotBlank(previousPushTokenType)) {
-      tags = tags.and(Tag.of("previousPushTokenType", previousPushTokenType));
+    if (previousPushTokenType != null) {
+      tags = tags.and(Tag.of("previousPushTokenType", previousPushTokenType.getTagValue()));
     }
+
     Metrics.counter(CREATE_COUNTER_NAME, tags).increment();
-    return account;
   }
 
   public Pair<Account, Device> addDevice(final UUID accountIdentifier, final DeviceSpec deviceSpec, final String linkDeviceToken)
@@ -534,7 +717,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     CompletableFuture
         .allOf(
             keysManager.deleteSingleUsePreKeys(account.getAccountIdentifier(), nextDeviceId),
-            account.getPhoneNumberIdentifierOptional()
+            account.getPhoneNumberIdentifier()
                 .map(pni -> keysManager.deleteSingleUsePreKeys(pni, nextDeviceId))
                 .orElse(CompletableFuture.completedFuture(null)),
             messagesManager.clear(account.getAccountIdentifier(), nextDeviceId))
@@ -544,7 +727,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
     final List<TransactWriteItem> additionalWriteItems = new ArrayList<>(keysManager.buildWriteItemsForNewDevice(
         account.getAccountIdentifier(),
-        account.getPhoneNumberIdentifierOptional(),
+        account.getPhoneNumberIdentifier(),
         nextDeviceId,
         deviceSpec.aciInfo().signedPreKey(),
         deviceSpec.pniInfo().map(DeviceIdentityInfo::signedPreKey),
@@ -728,7 +911,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
     CompletableFuture.allOf(
             keysManager.deleteSingleUsePreKeys(account.getAccountIdentifier(), deviceId),
-            account.getPhoneNumberIdentifierOptional()
+            account.getPhoneNumberIdentifier()
                 .map(pni -> keysManager.deleteSingleUsePreKeys(pni, deviceId))
                 .orElse(CompletableFuture.completedFuture(null)),
             messagesManager.clear(account.getAccountIdentifier(), deviceId))
@@ -739,7 +922,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     final List<TransactWriteItem> additionalWriteItems = new ArrayList<>(
         keysManager.buildWriteItemsForRemovedDevice(
             account.getAccountIdentifier(),
-            account.getPhoneNumberIdentifierOptional(),
+            account.getPhoneNumberIdentifier(),
             deviceId));
     try {
       accounts.updateTransactionally(account, additionalWriteItems);
@@ -749,7 +932,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       // Ensure any messages/single-use pre-keys that came in while we were working are also removed
       CompletableFuture.allOf(
               keysManager.deleteSingleUsePreKeys(account.getAccountIdentifier(), deviceId),
-              account.getPhoneNumberIdentifierOptional()
+              account.getPhoneNumberIdentifier()
                   .map(pni -> keysManager.deleteSingleUsePreKeys(pni, deviceId))
                   .orElse(CompletableFuture.completedFuture(null)),
               messagesManager.clear(account.getAccountIdentifier(), deviceId))
@@ -778,7 +961,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     final Account account = accounts.getByAccountIdentifier(accountIdentifier)
         .orElseThrow(() -> new IllegalArgumentException("Account not found: " + accountIdentifier));
 
-    final UUID originalPhoneNumberIdentifier = account.getPhoneNumberIdentifierOptional()
+    final UUID originalPhoneNumberIdentifier = account.getPhoneNumberIdentifier()
         .orElseThrow(() -> new IllegalArgumentException("Cannot change phone number for accounts without phone numbers"));
 
     final UUID targetPhoneNumberIdentifier = phoneNumberIdentifiers.getPhoneNumberIdentifier(targetNumber).join();
@@ -800,7 +983,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final Map<Byte, KEMSignedPreKey> pniPqLastResortPreKeys,
       final Map<Byte, Integer> pniRegistrationIds) throws MismatchedDevicesException {
 
-    final UUID originalPhoneNumberIdentifier = account.getPhoneNumberIdentifierOptional()
+    final UUID originalPhoneNumberIdentifier = account.getPhoneNumberIdentifier()
         .orElseThrow(() -> new IllegalArgumentException("Cannot change phone number for accounts without phone numbers"));
 
     validateDevices(account, pniSignedPreKeys, pniPqLastResortPreKeys, pniRegistrationIds);
@@ -1033,7 +1216,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   }
 
   public Account update(final Account account, final Consumer<Account> updater) {
-    final Account updatedAccount = update(account.getIdentifier(IdentityType.ACI), updater);
+    final Account updatedAccount = update(account.getAccountIdentifier(), updater);
     account.markStale();
 
     return updatedAccount;
@@ -1316,19 +1499,19 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
     account.getDevices().stream()
         .flatMap(device -> keysManager.buildWriteItemsForRemovedDevice(
-                account.getIdentifier(IdentityType.ACI),
-                account.getPhoneNumberIdentifierOptional(),
+                account.getAccountIdentifier(),
+                account.getPhoneNumberIdentifier(),
                 device.getId())
             .stream())
         .forEach(additionalWriteItems::add);
 
-    account.getPhoneNumberIdentifierOptional().ifPresent(phoneNumberIdentifier ->
+    account.getPhoneNumberIdentifier().ifPresent(phoneNumberIdentifier ->
         additionalWriteItems.add(phoneNumberRecoveryPasswordsManager.buildTransactWriteItemForRemovePassword(phoneNumberIdentifier)));
     CompletableFuture.allOf(
             secureStorageClient.deleteStoredData(account.getAccountIdentifier()),
             secureValueRecovery2Client.removeData(account.getAccountIdentifier()),
             keysManager.deleteSingleUsePreKeys(account.getAccountIdentifier()),
-            account.getPhoneNumberIdentifierOptional().map(keysManager::deleteSingleUsePreKeys).orElse(CompletableFuture.completedFuture(null)),
+            account.getPhoneNumberIdentifier().map(keysManager::deleteSingleUsePreKeys).orElse(CompletableFuture.completedFuture(null)),
             messagesManager.clear(account.getAccountIdentifier()),
             profilesManager.deleteAll(account.getAccountIdentifier(), true))
         .join();
@@ -1354,7 +1537,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
         cacheCluster.useCluster(connection -> {
           final RedisAdvancedClusterCommands<String, String> commands = connection.sync();
 
-          account.getPhoneNumberIdentifierOptional().ifPresent(pni ->
+          account.getPhoneNumberIdentifier().ifPresent(pni ->
               commands.setex(getAccountMapKey(pni.toString()), CACHE_TTL_SECONDS, account.getAccountIdentifier().toString()));
           commands.setex(getAccountEntityKey(account.getAccountIdentifier()), CACHE_TTL_SECONDS, accountJson);
         });
@@ -1374,7 +1557,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     }
 
     return cacheCluster.withCluster(connection -> CompletableFuture.allOf(
-        account.getPhoneNumberIdentifierOptional().map(pni ->
+        account.getPhoneNumberIdentifier().map(pni ->
                 connection.async().setex(getAccountMapKey(pni.toString()), CACHE_TTL_SECONDS, account.getAccountIdentifier().toString())
                     .toCompletableFuture())
             .orElseGet(() -> CompletableFuture.completedFuture(null)),
@@ -1503,7 +1686,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
   private void redisDelete(final Account account) {
     final List<String> keysToDelete = new ArrayList<>(2);
-    account.getPhoneNumberIdentifierOptional()
+    account.getPhoneNumberIdentifier()
         .map(pni -> getAccountMapKey(pni.toString()))
         .ifPresent(keysToDelete::add);
     keysToDelete.add(getAccountEntityKey(account.getAccountIdentifier()));
@@ -1605,8 +1788,8 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   }
 
   public CompletableFuture<Optional<TransferArchiveResult>> waitForTransferArchive(final Account account, final Device device, final Duration timeout) {
-    final DeviceIdentifier deviceIdentifier = new DeviceIdentifier(account.getAccountIdentifier(), device.getId(), device.getRegistrationId(IdentityType.ACI));
-    final String registrationIdTransferArchiveKey = getRegistrationIdTransferArchiveKey(account.getAccountIdentifier(), device.getId(), device.getRegistrationId(IdentityType.ACI));
+    final DeviceIdentifier deviceIdentifier = new DeviceIdentifier(account.getAccountIdentifier(), device.getId(), device.getAccountRegistrationId());
+    final String registrationIdTransferArchiveKey = getRegistrationIdTransferArchiveKey(account.getAccountIdentifier(), device.getId(), device.getAccountRegistrationId());
 
     return waitForPubSubKey(waitForTransferArchiveFuturesByDeviceIdentifier,
         deviceIdentifier,
@@ -1819,7 +2002,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final Account account = accounts.getByAccountIdentifier(accountIdentifier)
           .orElseThrow(ContestedOptimisticLockException::new);
 
-      account.getPhoneNumberIdentifierOptional()
+      account.getPhoneNumberIdentifier()
           .flatMap(phoneNumberRecoveryPasswordsManager::getPasswordAndWriteItemForMigration)
           .ifPresent(passwordAndWriteItem -> {
             account.setAccountRecoveryPassword(passwordAndWriteItem.first());
@@ -1834,5 +2017,133 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
       throw e;
     }
+  }
+
+  /// Generates and stores a pending TOTP key for the identified account. Accounts may have at most one pending TOTP
+  /// key.
+  ///
+  /// @param accountIdentifier the identifier of the account for which to generate and store a pending TOTP key
+  ///
+  /// @return the generated pending TOTP key
+  ///
+  /// @see [#confirmPendingTotpKey(UUID, int, Instant, byte[])
+  ///
+  /// @throws TooManyTotpKeysException if the target account already has at least [#MAX_TOTP_KEYS] TOTP keys
+  public TotpKey generatePendingTotpKey(final UUID accountIdentifier) throws TooManyTotpKeysException {
+    final SecretKey secretKey = totpKeyGenerator.generateKey();
+    final TotpKey pendingTotpKey = new TotpKey(TOTP_PARAMETERS, secretKey.getEncoded());
+
+    try {
+      update(accountIdentifier, account -> {
+        if (account.getTotpKeys().size() >= MAX_TOTP_KEYS) {
+          throw new UncheckedTooManyTotpKeysException();
+        }
+
+        account.setPendingTotpKey(pendingTotpKey);
+      });
+    } catch (final UncheckedTooManyTotpKeysException _) {
+      throw new TooManyTotpKeysException();
+    }
+
+    return pendingTotpKey;
+  }
+
+  /// Verifies that a caller has stored a copy of their pending TOTP key and can use it to generate one-time passwords,
+  /// then stores the key to the caller's account record.
+  ///
+  /// @param accountIdentifier the identifier of the account for which to confirm a pending TOTP key
+  /// @param oneTimePassword the one-time password the caller derived from the pending TOTP key
+  /// @param timestamp the time at which the user submitted the one-time password
+  ///
+  /// @return the account-specific ID for the confirmed key if the given one-time password is valid for either a pending
+  /// TOTP password for the given account or for a one-time password previously verified for the given account or empty
+  /// otherwise
+  ///
+  /// @see [#generatePendingTotpKey(UUID)
+  public Optional<Integer> confirmPendingTotpKey(final UUID accountIdentifier,
+      final int oneTimePassword,
+      final Instant timestamp,
+      final byte[] metadataCiphertext) {
+
+    final Optional<Account> maybeAccount = accounts.getByAccountIdentifier(accountIdentifier);
+
+    if (maybeAccount.isEmpty()) {
+      return Optional.empty();
+    }
+
+    final Optional<TotpKey> maybePendingTotpKey = maybeAccount.flatMap(Account::getPendingTotpKey);
+
+    if (maybePendingTotpKey.isPresent()) {
+      final TotpKey pendingTotpKey = maybePendingTotpKey.get();
+
+      try {
+        if (totpGenerator.validateOneTimePassword(pendingTotpKey, timestamp, oneTimePassword)) {
+          final AtomicInteger keyId = new AtomicInteger();
+
+          update(accountIdentifier, account -> {
+            final Map<Integer, AnnotatedTotpKey> updatedTotpKeys = new HashMap<>(account.getTotpKeys());
+
+            keyId.set(account.getNextTotpKeyId());
+
+            updatedTotpKeys.put(keyId.get(),
+                new AnnotatedTotpKey(new TotpKey(pendingTotpKey.totpParameters(), pendingTotpKey.encodedKey()), metadataCiphertext));
+
+            account.setPendingTotpKey(null);
+            account.setTotpKeys(updatedTotpKeys);
+          });
+
+          return Optional.of(keyId.get());
+        }
+      } catch (final InvalidKeyException e) {
+        ImpossibleEvents.logImpossible(logger, "Invalid pending TOTP key for account {}", accountIdentifier, e);
+      }
+    }
+
+    // Either there was no pending TOTP password for the given account identifier or the given one-time password
+    // wasn't valid for the pending key. Either way, see if it's a valid one-time password for a key stored on the
+    // account record in case the caller is retrying a dropped request (in which case we've stored a previously
+    // pending key on the account record).
+    //
+    // It's possible (though unlikely) that more than one key will produce the same one-time password at a given
+    // instant. To compensate, we just check the key with the highest ID (i.e. the most recent). It's also theoretically
+    // possible that a user will have iterated through so many keys that they've wrapped around into negative integers,
+    // but that's not really a practical concern.
+    return getByAccountIdentifier(accountIdentifier)
+        .flatMap(account -> account.getTotpKeys().entrySet().stream()
+            .max(Map.Entry.comparingByKey())
+            .filter(entry -> {
+              try {
+                return totpGenerator.validateOneTimePassword(entry.getValue(), timestamp, oneTimePassword);
+              } catch (final InvalidKeyException e) {
+                ImpossibleEvents.logImpossible(logger, "Invalid TOTP key for account {}", accountIdentifier, e);
+                return false;
+              }
+            })
+            .map(Map.Entry::getKey));
+  }
+
+  public boolean verifyTotp(final Account account, final Instant validationTimestamp, @Nullable final Integer oneTimePassword) {
+    if (account.getTotpKeys().isEmpty()) {
+      return oneTimePassword == null;
+    }
+
+    if (oneTimePassword == null) {
+      // The account has TOTP keys, but the caller hasn't provided a one-time password
+      return false;
+    }
+
+    for (final Instant timestamp : new Instant[] { validationTimestamp, validationTimestamp.minus(maxTotpValidationDelay) }) {
+      for (final SecretKey totpKey : account.getTotpKeys().values()) {
+        try {
+          if (totpGenerator.validateOneTimePassword(totpKey, timestamp, oneTimePassword)) {
+            return true;
+          }
+        } catch (final InvalidKeyException e) {
+          ImpossibleEvents.logImpossible(logger, "Invalid TOTP key for account {}", account.getAccountIdentifier(), e);
+        }
+      }
+    }
+
+    return false;
   }
 }

@@ -33,6 +33,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator;
 import com.google.i18n.phonenumbers.PhoneNumberUtil;
 import io.lettuce.core.RedisException;
 import io.lettuce.core.api.async.RedisAsyncCommands;
@@ -41,6 +42,7 @@ import io.lettuce.core.cluster.api.sync.RedisAdvancedClusterCommands;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -59,11 +61,19 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
+import javax.crypto.KeyGenerator;
 import javax.crypto.spec.SecretKeySpec;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.function.Executable;
@@ -86,7 +96,6 @@ import org.whispersystems.textsecuregcm.entities.AccountAttributes;
 import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClient;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
@@ -117,6 +126,8 @@ class AccountsManagerTest {
   private static final byte[] ENCRYPTED_USERNAME_2 = Base64.getUrlDecoder().decode(BASE_64_URL_ENCRYPTED_USERNAME_2);
 
   private static final byte[] LINK_DEVICE_SECRET = "link-device-secret".getBytes(StandardCharsets.UTF_8);
+
+  private static final Duration MAX_TOTP_VALIDATION_DELAY = AccountsManager.TOTP_PARAMETERS.timeStep().dividedBy(2);
 
   private static TestClock CLOCK;
 
@@ -241,7 +252,8 @@ class AccountsManagerTest {
         mock(ScheduledExecutorService.class),
         mock(ScheduledExecutorService.class),
         CLOCK,
-        LINK_DEVICE_SECRET);
+        LINK_DEVICE_SECRET,
+        MAX_TOTP_VALIDATION_DELAY);
   }
 
   @ParameterizedTest
@@ -320,11 +332,11 @@ class AccountsManagerTest {
     assertEquals(account.get().getAccountIdentifier(), uuid);
 
     if (hasNumber) {
-      assertEquals("+14152222222", account.get().getNumberOptional().orElseThrow());
-      assertEquals(UUID.fromString("de24dc73-fbd8-41be-a7d5-764c70d9da7e"), account.get().getPhoneNumberIdentifierOptional().orElseThrow());
+      assertEquals("+14152222222", account.get().getNumber().orElseThrow());
+      assertEquals(UUID.fromString("de24dc73-fbd8-41be-a7d5-764c70d9da7e"), account.get().getPhoneNumberIdentifier().orElseThrow());
     } else {
-      assertTrue(account.get().getNumberOptional().isEmpty());
-      assertTrue(account.get().getPhoneNumberIdentifierOptional().isEmpty());
+      assertTrue(account.get().getNumber().isEmpty());
+      assertTrue(account.get().getPhoneNumberIdentifier().isEmpty());
     }
 
     verify(clusterCommands, times(1)).get(eq("Account3::" + uuid));
@@ -353,11 +365,11 @@ class AccountsManagerTest {
     assertEquals(account.get().getAccountIdentifier(), uuid);
 
     if (hasNumber) {
-      assertEquals( "+14152222222", account.get().getNumberOptional().orElseThrow());
-      assertEquals(UUID.fromString("de24dc73-fbd8-41be-a7d5-764c70d9da7e"), account.get().getPhoneNumberIdentifierOptional().orElseThrow());
+      assertEquals( "+14152222222", account.get().getNumber().orElseThrow());
+      assertEquals(UUID.fromString("de24dc73-fbd8-41be-a7d5-764c70d9da7e"), account.get().getPhoneNumberIdentifier().orElseThrow());
     } else {
-      assertTrue(account.get().getNumberOptional().isEmpty());
-      assertTrue(account.get().getPhoneNumberIdentifierOptional().isEmpty());
+      assertTrue(account.get().getNumber().isEmpty());
+      assertTrue(account.get().getPhoneNumberIdentifier().isEmpty());
     }
 
     verify(asyncClusterCommands, times(1)).get(eq("Account3::" + uuid));
@@ -378,8 +390,8 @@ class AccountsManagerTest {
     Optional<Account> account = accountsManager.getByPhoneNumberIdentifier(pni);
 
     assertTrue(account.isPresent());
-    assertEquals("+14152222222", account.get().getNumberOptional().orElseThrow());
-    assertEquals(UUID.fromString("de24dc73-fbd8-41be-a7d5-764c70d9da7e"), account.get().getPhoneNumberIdentifierOptional().orElseThrow());
+    assertEquals("+14152222222", account.get().getNumber().orElseThrow());
+    assertEquals(UUID.fromString("de24dc73-fbd8-41be-a7d5-764c70d9da7e"), account.get().getPhoneNumberIdentifier().orElseThrow());
 
     verify(clusterCommands).get(eq("AccountMap::" + pni));
     verify(clusterCommands).get(eq("Account3::" + uuid));
@@ -404,8 +416,8 @@ class AccountsManagerTest {
     Optional<Account> account = accountsManager.getByPhoneNumberIdentifierAsync(pni).join();
 
     assertTrue(account.isPresent());
-    assertEquals("+14152222222", account.get().getNumberOptional().orElseThrow());
-    assertEquals(UUID.fromString("de24dc73-fbd8-41be-a7d5-764c70d9da7e"), account.get().getPhoneNumberIdentifierOptional().orElseThrow());
+    assertEquals("+14152222222", account.get().getNumber().orElseThrow());
+    assertEquals(UUID.fromString("de24dc73-fbd8-41be-a7d5-764c70d9da7e"), account.get().getPhoneNumberIdentifier().orElseThrow());
 
     verify(asyncClusterCommands).get(eq("AccountMap::" + pni));
     verify(asyncClusterCommands).get(eq("Account3::" + uuid));
@@ -778,10 +790,10 @@ class AccountsManagerTest {
       verify(keysManager, never()).deleteSingleUsePreKeys(argThat(id -> !id.equals(aci)), anyByte());
     } else {
       //noinspection OptionalGetWithoutIsPresent
-      verify(keysManager, times(2)).deleteSingleUsePreKeys(eq(account.getPhoneNumberIdentifierOptional().get()), eq(linkedDevice.getId()));
+      verify(keysManager, times(2)).deleteSingleUsePreKeys(eq(account.getPhoneNumberIdentifier().get()), eq(linkedDevice.getId()));
     }
 
-    verify(keysManager).buildWriteItemsForRemovedDevice(aci, account.getPhoneNumberIdentifierOptional(), linkedDevice.getId());
+    verify(keysManager).buildWriteItemsForRemovedDevice(aci, account.getPhoneNumberIdentifier(), linkedDevice.getId());
     verify(disconnectionRequestManager).requestDisconnection(aci, List.of(linkedDevice.getId()));
   }
 
@@ -822,7 +834,7 @@ class AccountsManagerTest {
     // Check existence (or lack thereof) of phone number, phone number identifier, phone number identity key,
     // phone number identity registration ID, and auth credential salt.
     final Device primaryDevice = createdAccount.getDevices().stream().findFirst().orElseThrow();
-    assertEquals(maybeE164, createdAccount.getNumberOptional());
+    assertEquals(maybeE164, createdAccount.getNumber());
     maybeE164.ifPresentOrElse(
         number -> {
           assertTrue(phoneNumberIdentifiersByE164.containsKey(number));
@@ -838,13 +850,13 @@ class AccountsManagerTest {
         });
 
     if (maybeE164.isPresent()) {
-      verify(accounts).create(argThat(account -> maybeE164.equals(account.getNumberOptional())), any());
+      verify(accounts).create(argThat(account -> maybeE164.equals(account.getNumber())), any());
     } else {
-      verify(accounts).create(argThat(account -> account.getNumberOptional().isEmpty()), any(), any(), any());
+      verify(accounts).create(argThat(account -> account.getNumber().isEmpty()), any(), any(), any());
     }
     verify(keysManager).buildWriteItemsForNewDevice(
         eq(createdAccount.getAccountIdentifier()),
-        eq(createdAccount.getPhoneNumberIdentifierOptional()),
+        eq(createdAccount.getPhoneNumberIdentifier()),
         eq(Device.PRIMARY_ID),
         notNull(),
         maybeE164.isPresent() ? notNull() : eq(Optional.empty()),
@@ -877,8 +889,8 @@ class AccountsManagerTest {
 
       final Account existingAccount = mock(Account.class);
       when(existingAccount.getAccountIdentifier()).thenReturn(existingUuid);
-      when(existingAccount.getNumberOptional()).thenReturn(maybeExistingAccountE164);
-      when(existingAccount.getPhoneNumberIdentifierOptional()).thenReturn(requestedAccount.getPhoneNumberIdentifierOptional());
+      when(existingAccount.getNumber()).thenReturn(maybeExistingAccountE164);
+      when(existingAccount.getPhoneNumberIdentifier()).thenReturn(requestedAccount.getPhoneNumberIdentifier());
       when(existingAccount.getPrimaryDevice()).thenReturn(existingPrimaryDevice);
       when(existingAccount.getAccountIdentityKey()).thenReturn(requestedAccount.getAccountIdentityKey());
       when(existingAccount.getAccountRecoveryPassword()).thenReturn(
@@ -903,7 +915,7 @@ class AccountsManagerTest {
     // and phone number identity registration ID
     final Device primaryDevice = reregisteredAccount.getDevices().stream().findFirst().orElseThrow();
 
-    assertEquals(maybeE164, reregisteredAccount.getNumberOptional());
+    assertEquals(maybeE164, reregisteredAccount.getNumber());
     maybeE164.ifPresentOrElse(
         number -> {
           assertTrue(phoneNumberIdentifiersByE164.containsKey(number));
@@ -926,7 +938,7 @@ class AccountsManagerTest {
 
     verify(keysManager).buildWriteItemsForNewDevice(
         eq(reregisteredAccount.getAccountIdentifier()),
-        eq(reregisteredAccount.getPhoneNumberIdentifierOptional()),
+        eq(reregisteredAccount.getPhoneNumberIdentifier()),
         eq(Device.PRIMARY_ID),
         notNull(),
         maybeE164.isPresent() ? notNull() : eq(Optional.empty()),
@@ -951,6 +963,198 @@ class AccountsManagerTest {
         Arguments.argumentSet("Re-register a numberless account", Optional.empty(), Optional.empty()));
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void reclaim(final boolean hasPhoneNumber) {
+    final Account existingAccount = new Account();
+    existingAccount.setAccountIdentifier(UUID.randomUUID());
+
+    final Device existingPrimaryDevice = new Device();
+    existingPrimaryDevice.setId(Device.PRIMARY_ID);
+
+    existingAccount.addDevice(existingPrimaryDevice);
+
+    final byte[] recoveryPassword = TestRandomUtil.nextBytes(16);
+
+    existingAccount.setAccountRecoveryPassword(recoveryPassword);
+
+    final int aciRegistrationId = 17;
+    final int pniRegistrationId = 19;
+
+    final ECKeyPair aciKeyPair = ECKeyPair.generate();
+    final ECKeyPair pniKeyPair = ECKeyPair.generate();
+    final IdentityKey aciIdentityKey = new IdentityKey(aciKeyPair.getPublicKey());
+    final IdentityKey pniIdentityKey = new IdentityKey(pniKeyPair.getPublicKey());
+    final ECSignedPreKey aciSignedPreKey = KeysHelper.signedECPreKey(1, aciKeyPair);
+    final ECSignedPreKey pniSignedPreKey = KeysHelper.signedECPreKey(2, pniKeyPair);
+    final KEMSignedPreKey aciPqLastResortPreKey = KeysHelper.signedKEMPreKey(3, aciKeyPair);
+    final KEMSignedPreKey pniPqLastResortPreKey = KeysHelper.signedKEMPreKey(4, pniKeyPair);
+
+    if (hasPhoneNumber) {
+      existingAccount.setNumber(PhoneNumberUtil.getInstance().format(
+          PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164),
+          UUID.randomUUID());
+    }
+
+    final AccountAttributes accountAttributes = new AccountAttributes(false,
+        aciRegistrationId,
+        hasPhoneNumber ? pniRegistrationId : null,
+        TestRandomUtil.nextBytes(16),
+        hasPhoneNumber ? "registration-lock" : null,
+        hasPhoneNumber,
+        Collections.emptySet(),
+        recoveryPassword);
+
+    final DeviceSpec primaryDeviceSpec = new DeviceSpec(
+        TestRandomUtil.nextBytes(16),
+        RandomStringUtils.insecure().nextAlphanumeric(12),
+        "test",
+        Collections.emptySet(),
+        new DeviceIdentityInfo(aciRegistrationId, aciSignedPreKey, aciPqLastResortPreKey),
+        Optional.of(new DeviceIdentityInfo(pniRegistrationId, pniSignedPreKey, pniPqLastResortPreKey)).filter(_ -> hasPhoneNumber),
+        true,
+        Optional.empty(),
+        Optional.empty());
+
+    when(accounts.reclaimAccount(any(), any(), any())).thenReturn(CompletableFuture.completedFuture(null));
+
+    final Account reclaimedAccount = accountsManager.recover(existingAccount,
+        accountAttributes,
+        aciIdentityKey,
+        hasPhoneNumber ? Optional.of(pniIdentityKey) : Optional.empty(),
+        primaryDeviceSpec,
+        null);
+
+    assertEquals(existingAccount.getAccountIdentifier(), reclaimedAccount.getAccountIdentifier());
+    assertEquals(existingAccount.getNumber(), reclaimedAccount.getNumber());
+    assertEquals(existingAccount.getPhoneNumberIdentifier(), reclaimedAccount.getPhoneNumberIdentifier());
+    assertEquals(aciIdentityKey, reclaimedAccount.getAccountIdentityKey());
+    assertEquals(hasPhoneNumber ? Optional.of(pniIdentityKey) : Optional.empty(), reclaimedAccount.getPhoneNumberIdentityKey());
+
+    final Device reclaimedPrimaryDevice = reclaimedAccount.getPrimaryDevice();
+    assertArrayEquals(primaryDeviceSpec.deviceNameCiphertext(), reclaimedPrimaryDevice.getName());
+    assertEquals(primaryDeviceSpec.signalAgent(), reclaimedPrimaryDevice.getUserAgent());
+    assertEquals(aciRegistrationId, reclaimedPrimaryDevice.getAccountRegistrationId());
+    assertEquals(hasPhoneNumber ? Optional.of(pniRegistrationId) : Optional.empty(), reclaimedPrimaryDevice.getPhoneNumberIdentityRegistrationId());
+    assertTrue(reclaimedPrimaryDevice.getFetchesMessages());
+    assertTrue(StringUtils.isBlank(reclaimedPrimaryDevice.getApnId()));
+    assertTrue(StringUtils.isBlank(reclaimedPrimaryDevice.getGcmId()));
+
+    assertTrue(reclaimedAccount.getAccountRecoveryPassword().orElseThrow().verify(HexFormat.of().formatHex(recoveryPassword)));
+    assertTrue(reclaimedPrimaryDevice.getAuthTokenHash().verify(primaryDeviceSpec.password()));
+
+    verify(accounts).reclaimAccount(eq(existingAccount), argThat(account -> existingAccount.getAccountIdentifier().equals(account.getAccountIdentifier())), any());
+
+    verify(keysManager).buildWriteItemsForNewDevice(
+        eq(reclaimedAccount.getAccountIdentifier()),
+        eq(reclaimedAccount.getPhoneNumberIdentifier()),
+        eq(Device.PRIMARY_ID),
+        notNull(),
+        hasPhoneNumber ? notNull() : eq(Optional.empty()),
+        notNull(),
+        hasPhoneNumber ? notNull() : eq(Optional.empty()));
+
+    verify(keysManager, times(2)).deleteSingleUsePreKeys(existingAccount.getAccountIdentifier());
+    existingAccount.getPhoneNumberIdentifier().ifPresent(phoneNumberIdentifier ->
+        verify(keysManager, times(2)).deleteSingleUsePreKeys(phoneNumberIdentifier));
+    verify(messagesManager, times(2)).clear(existingAccount.getAccountIdentifier());
+    verify(profilesManager, times(2)).deleteAll(existingAccount.getAccountIdentifier(), false);
+    verify(disconnectionRequestManager).requestDisconnection(argThat(account ->
+        account.getAccountIdentifier().equals(existingAccount.getAccountIdentifier()) && account != reclaimedAccount));
+    verify(changeNumberWaitingPeriodManager).handleAccountCreated(eq(existingAccount.getAccountIdentifier()), any(Instant.class));
+  }
+
+  @Test
+  void reclaimPniPresenceMismatch() {
+    final Account existingAccount = new Account();
+    existingAccount.setAccountIdentifier(UUID.randomUUID());
+
+    final Device existingPrimaryDevice = new Device();
+    existingPrimaryDevice.setId(Device.PRIMARY_ID);
+
+    existingAccount.addDevice(existingPrimaryDevice);
+
+    final byte[] recoveryPassword = TestRandomUtil.nextBytes(16);
+
+    existingAccount.setAccountRecoveryPassword(recoveryPassword);
+
+    final int aciRegistrationId = 17;
+    final int pniRegistrationId = 19;
+
+    final ECKeyPair aciKeyPair = ECKeyPair.generate();
+    final ECKeyPair pniKeyPair = ECKeyPair.generate();
+    final IdentityKey aciIdentityKey = new IdentityKey(aciKeyPair.getPublicKey());
+    final IdentityKey pniIdentityKey = new IdentityKey(pniKeyPair.getPublicKey());
+    final ECSignedPreKey aciSignedPreKey = KeysHelper.signedECPreKey(1, aciKeyPair);
+    final ECSignedPreKey pniSignedPreKey = KeysHelper.signedECPreKey(2, pniKeyPair);
+    final KEMSignedPreKey aciPqLastResortPreKey = KeysHelper.signedKEMPreKey(3, aciKeyPair);
+    final KEMSignedPreKey pniPqLastResortPreKey = KeysHelper.signedKEMPreKey(4, pniKeyPair);
+
+    existingAccount.setNumber(PhoneNumberUtil.getInstance().format(
+            PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164),
+        UUID.randomUUID());
+
+    {
+      final AccountAttributes accountAttributes = new AccountAttributes(false,
+          aciRegistrationId,
+          pniRegistrationId,
+          TestRandomUtil.nextBytes(16),
+          "registration-lock",
+          true,
+          Collections.emptySet(),
+          recoveryPassword);
+
+      final DeviceSpec primaryDeviceSpec = new DeviceSpec(
+          TestRandomUtil.nextBytes(16),
+          RandomStringUtils.insecure().nextAlphanumeric(12),
+          "test",
+          Collections.emptySet(),
+          new DeviceIdentityInfo(aciRegistrationId, aciSignedPreKey, aciPqLastResortPreKey),
+          Optional.of(new DeviceIdentityInfo(pniRegistrationId, pniSignedPreKey, pniPqLastResortPreKey)),
+          true,
+          Optional.empty(),
+          Optional.empty());
+
+      assertThrows(IllegalArgumentException.class, () -> accountsManager.recover(existingAccount,
+          accountAttributes,
+          aciIdentityKey,
+          Optional.empty(),
+          primaryDeviceSpec,
+          null));
+    }
+
+    existingAccount.setNumber(null, null);
+
+    {
+      final AccountAttributes accountAttributes = new AccountAttributes(false,
+          aciRegistrationId,
+          null,
+          TestRandomUtil.nextBytes(16),
+          null,
+          false,
+          Collections.emptySet(),
+          recoveryPassword);
+
+      final DeviceSpec primaryDeviceSpec = new DeviceSpec(
+          TestRandomUtil.nextBytes(16),
+          RandomStringUtils.insecure().nextAlphanumeric(12),
+          "test",
+          Collections.emptySet(),
+          new DeviceIdentityInfo(aciRegistrationId, aciSignedPreKey, aciPqLastResortPreKey),
+          Optional.empty(),
+          true,
+          Optional.empty(),
+          Optional.empty());
+
+      assertThrows(IllegalArgumentException.class, () -> accountsManager.recover(existingAccount,
+          accountAttributes,
+          aciIdentityKey,
+          Optional.of(pniIdentityKey),
+          primaryDeviceSpec,
+          null));
+    }
+  }
+
   @Test
   void testCreateAccountRecentlyDeleted() throws InterruptedException, AccountAlreadyExistsException {
     final UUID recentlyDeletedUuid = UUID.randomUUID();
@@ -964,11 +1168,11 @@ class AccountsManagerTest {
     final Account account = createAccount(e164, attributes);
 
     verify(accounts).create(
-        argThat(a -> e164.equals(a.getNumberOptional().get()) && recentlyDeletedUuid.equals(a.getAccountIdentifier())),
+        argThat(a -> e164.equals(a.getNumber().get()) && recentlyDeletedUuid.equals(a.getAccountIdentifier())),
         any());
 
     verify(keysManager).buildWriteItemsForNewDevice(eq(account.getAccountIdentifier()),
-        eq(account.getPhoneNumberIdentifierOptional()),
+        eq(account.getPhoneNumberIdentifier()),
         eq(Device.PRIMARY_ID),
         any(),
         any(),
@@ -1011,7 +1215,7 @@ class AccountsManagerTest {
       ? AccountsHelper.generateTestAccount(phoneNumber, List.of(generateTestDevice(CLOCK.millis())))
       : AccountsHelper.generateTestAccountNoPhoneNumber(List.of(generateTestDevice(CLOCK.millis())));
     final UUID aci = account.getAccountIdentifier();
-    final Optional<UUID> maybePni = account.getPhoneNumberIdentifierOptional();
+    final Optional<UUID> maybePni = account.getPhoneNumberIdentifier();
     account.setIdentityKey(new IdentityKey(ECKeyPair.generate().getPublicKey()));
 
     final byte nextDeviceId = account.getNextDeviceId();
@@ -1126,7 +1330,7 @@ class AccountsManagerTest {
         Map.of(Device.PRIMARY_ID, kemLastResortPreKey),
         Map.of(Device.PRIMARY_ID, 1));
 
-    assertEquals(targetNumber, account.getNumber());
+    assertEquals(Optional.of(targetNumber), account.getNumber());
 
     assertTrue(phoneNumberIdentifiersByE164.containsKey(targetNumber));
 
@@ -1149,17 +1353,17 @@ class AccountsManagerTest {
 
     addRetrievableAccount(account);
 
-    phoneNumberIdentifiersByE164.put(originalNumber, account.getPhoneNumberIdentifier());
-    phoneNumberIdentifiersByE164.put(newNumber, account.getPhoneNumberIdentifier());
-    account = accountsManager.changeNumber(account.getIdentifier(IdentityType.ACI),
+    phoneNumberIdentifiersByE164.put(originalNumber, account.getPhoneNumberIdentifier().orElseThrow());
+    phoneNumberIdentifiersByE164.put(newNumber, account.getPhoneNumberIdentifier().orElseThrow());
+    account = accountsManager.changeNumber(account.getAccountIdentifier(),
         newNumber,
         new IdentityKey(pniIdentityKeyPair.getPublicKey()),
         Map.of(Device.PRIMARY_ID, KeysHelper.signedECPreKey(1, pniIdentityKeyPair)),
         Map.of(Device.PRIMARY_ID, KeysHelper.signedKEMPreKey(2, pniIdentityKeyPair)),
         Map.of(Device.PRIMARY_ID, 1));
 
-    assertEquals(newNumber, account.getNumber());
-    assertEquals(phoneNumberIdentifier, account.getIdentifier(IdentityType.PNI));
+    assertEquals(Optional.of(newNumber), account.getNumber());
+    assertEquals(Optional.of(phoneNumberIdentifier), account.getPhoneNumberIdentifier());
     verify(accounts, never()).delete(any(), any());
   }
 
@@ -1189,7 +1393,7 @@ class AccountsManagerTest {
         Map.of(Device.PRIMARY_ID, kemLastResoryPreKey),
         Map.of(Device.PRIMARY_ID, 1));
 
-    assertEquals(targetNumber, account.getNumber());
+    assertEquals(Optional.of(targetNumber), account.getNumber());
 
     assertTrue(phoneNumberIdentifiersByE164.containsKey(targetNumber));
     final UUID newPni = phoneNumberIdentifiersByE164.get(targetNumber);
@@ -1234,7 +1438,7 @@ class AccountsManagerTest {
     final Account updatedAccount = accountsManager.changeNumber(
         uuid, targetNumber, new IdentityKey(ECKeyPair.generate().getPublicKey()), newSignedKeys, newSignedPqKeys, newRegistrationIds);
 
-    assertEquals(targetNumber, updatedAccount.getNumber());
+    assertEquals(Optional.of(targetNumber), updatedAccount.getNumber());
 
     assertTrue(phoneNumberIdentifiersByE164.containsKey(targetNumber));
 
@@ -1298,7 +1502,7 @@ class AccountsManagerTest {
 
     final List<byte[]> usernameHashes = List.of(TestRandomUtil.nextBytes(32), TestRandomUtil.nextBytes(32));
 
-    final UsernameReservation result = accountsManager.reserveUsernameHash(account.getIdentifier(IdentityType.ACI), usernameHashes);
+    final UsernameReservation result = accountsManager.reserveUsernameHash(account.getAccountIdentifier(), usernameHashes);
     assertArrayEquals(usernameHashes.getFirst(), result.reservedUsernameHash());
     verify(accounts, times(1)).reserveUsernameHash(eq(account), any(), eq(Duration.ofMinutes(5)));
   }
@@ -1312,7 +1516,7 @@ class AccountsManagerTest {
 
     final List<byte[]> usernameHashes = List.of(TestRandomUtil.nextBytes(32), oldUsernameHash, TestRandomUtil.nextBytes(32));
 
-    final UsernameReservation result = accountsManager.reserveUsernameHash(account.getIdentifier(IdentityType.ACI), usernameHashes);
+    final UsernameReservation result = accountsManager.reserveUsernameHash(account.getAccountIdentifier(), usernameHashes);
     assertArrayEquals(oldUsernameHash, result.reservedUsernameHash());
     verify(accounts, never()).reserveUsernameHash(any(), any(), any());
   }
@@ -1328,7 +1532,7 @@ class AccountsManagerTest {
         .doNothing()
         .when(accounts).reserveUsernameHash(any(), any(), any());
 
-    final UsernameReservation result = accountsManager.reserveUsernameHash(account.getIdentifier(IdentityType.ACI), usernameHashes);
+    final UsernameReservation result = accountsManager.reserveUsernameHash(account.getAccountIdentifier(), usernameHashes);
     assertArrayEquals(usernameHashes.getFirst(), result.reservedUsernameHash());
     verify(accounts, times(2)).reserveUsernameHash(eq(account), any(), eq(Duration.ofMinutes(5)));
   }
@@ -1342,7 +1546,7 @@ class AccountsManagerTest {
         .when(accounts).reserveUsernameHash(any(), any(), any());
 
     assertThrows(UsernameHashNotAvailableException.class, () ->
-        accountsManager.reserveUsernameHash(account.getIdentifier(IdentityType.ACI), List.of(USERNAME_HASH_1, USERNAME_HASH_2)));
+        accountsManager.reserveUsernameHash(account.getAccountIdentifier(), List.of(USERNAME_HASH_1, USERNAME_HASH_2)));
   }
 
   @ParameterizedTest
@@ -1353,7 +1557,7 @@ class AccountsManagerTest {
 
     setReservationHash(account, USERNAME_HASH_1);
 
-    accountsManager.confirmReservedUsernameHash(account.getIdentifier(IdentityType.ACI), USERNAME_HASH_1, ENCRYPTED_USERNAME_1);
+    accountsManager.confirmReservedUsernameHash(account.getAccountIdentifier(), USERNAME_HASH_1, ENCRYPTED_USERNAME_1);
     verify(accounts).confirmUsernameHash(eq(account), eq(USERNAME_HASH_1), eq(ENCRYPTED_USERNAME_1));
   }
 
@@ -1367,7 +1571,7 @@ class AccountsManagerTest {
         .doNothing()
         .when(accounts).confirmUsernameHash(account, USERNAME_HASH_1, ENCRYPTED_USERNAME_1);
 
-    accountsManager.confirmReservedUsernameHash(account.getIdentifier(IdentityType.ACI), USERNAME_HASH_1, ENCRYPTED_USERNAME_1);
+    accountsManager.confirmReservedUsernameHash(account.getAccountIdentifier(), USERNAME_HASH_1, ENCRYPTED_USERNAME_1);
     verify(accounts, times(2)).confirmUsernameHash(eq(account), eq(USERNAME_HASH_1), eq(ENCRYPTED_USERNAME_1));
   }
 
@@ -1378,7 +1582,7 @@ class AccountsManagerTest {
 
     setReservationHash(account, USERNAME_HASH_1);
     assertThrows(UsernameReservationNotFoundException.class,
-        () -> accountsManager.confirmReservedUsernameHash(account.getIdentifier(IdentityType.ACI), USERNAME_HASH_2, ENCRYPTED_USERNAME_2));
+        () -> accountsManager.confirmReservedUsernameHash(account.getAccountIdentifier(), USERNAME_HASH_2, ENCRYPTED_USERNAME_2));
   }
 
   @Test
@@ -1390,7 +1594,7 @@ class AccountsManagerTest {
     doThrow(new UsernameHashNotAvailableException())
         .when(accounts).confirmUsernameHash(account, USERNAME_HASH_1, ENCRYPTED_USERNAME_1);
     assertThrows(UsernameHashNotAvailableException.class,
-        () -> accountsManager.confirmReservedUsernameHash(account.getIdentifier(IdentityType.ACI), USERNAME_HASH_1, ENCRYPTED_USERNAME_1));
+        () -> accountsManager.confirmReservedUsernameHash(account.getAccountIdentifier(), USERNAME_HASH_1, ENCRYPTED_USERNAME_1));
     assertTrue(account.getUsernameHash().isEmpty());
   }
 
@@ -1401,7 +1605,7 @@ class AccountsManagerTest {
     account.setUsernameHash(USERNAME_HASH_1);
 
     // reserved username already set, should be treated as a replay
-    accountsManager.confirmReservedUsernameHash(account.getIdentifier(IdentityType.ACI), USERNAME_HASH_1, ENCRYPTED_USERNAME_1);
+    accountsManager.confirmReservedUsernameHash(account.getAccountIdentifier(), USERNAME_HASH_1, ENCRYPTED_USERNAME_1);
     verify(accounts, never()).confirmUsernameHash(any(), any(), any());
   }
 
@@ -1412,7 +1616,7 @@ class AccountsManagerTest {
     addRetrievableAccount(account);
 
     assertThrows(UsernameReservationNotFoundException.class,
-        () -> accountsManager.confirmReservedUsernameHash(account.getIdentifier(IdentityType.ACI), USERNAME_HASH_1, ENCRYPTED_USERNAME_1));
+        () -> accountsManager.confirmReservedUsernameHash(account.getAccountIdentifier(), USERNAME_HASH_1, ENCRYPTED_USERNAME_1));
     verify(accounts, never()).confirmUsernameHash(any(), any(), any());
   }
 
@@ -1423,7 +1627,7 @@ class AccountsManagerTest {
     addRetrievableAccount(account);
 
     account.setUsernameHash(USERNAME_HASH_1);
-    accountsManager.clearUsernameHash(account.getIdentifier(IdentityType.ACI));
+    accountsManager.clearUsernameHash(account.getAccountIdentifier());
     verify(accounts).clearUsernameHash(eq(account));
   }
 
@@ -1434,7 +1638,7 @@ class AccountsManagerTest {
     addRetrievableAccount(account);
 
     assertThrows(AssertionError.class, () ->
-        accountsManager.update(account.getIdentifier(IdentityType.ACI), a -> a.setUsernameHash(USERNAME_HASH_1)));
+        accountsManager.update(account.getAccountIdentifier(), a -> a.setUsernameHash(USERNAME_HASH_1)));
   }
 
   @Test
@@ -1470,10 +1674,8 @@ class AccountsManagerTest {
     final Account parsedAccount = AccountsManager.parseAccountJson(serialized, originalAccount.getAccountIdentifier()).orElseThrow();
 
     assertEquals(originalAccount.getAccountIdentifier(), parsedAccount.getAccountIdentifier());
-    assertEquals(originalAccount.getPhoneNumberIdentifierOptional(), parsedAccount.getPhoneNumberIdentifierOptional());
-    assertEquals(originalAccount.getAccountIdentifier(), parsedAccount.getAccountIdentifier());
-    assertEquals(originalAccount.getPhoneNumberIdentifierOptional(), parsedAccount.getPhoneNumberIdentifierOptional());
-    assertEquals(originalAccount.getNumberOptional(), parsedAccount.getNumberOptional());
+    assertEquals(originalAccount.getPhoneNumberIdentifier(), parsedAccount.getPhoneNumberIdentifier());
+    assertEquals(originalAccount.getNumber(), parsedAccount.getNumber());
     assertArrayEquals(originalAccount.getUnidentifiedAccessKey().orElseThrow(),
         parsedAccount.getUnidentifiedAccessKey().orElseThrow());
     assertEquals(originalAccount.isDiscoverableByPhoneNumber(), parsedAccount.isDiscoverableByPhoneNumber());
@@ -1694,7 +1896,7 @@ class AccountsManagerTest {
   @Test
   void getAccountsForChangeNumber() {
     final Account account = AccountsHelper.generateTestAccount("+14152222222", UUID.randomUUID(), UUID.randomUUID(), new ArrayList<>(), new byte[UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH]);
-    final UUID accountIdentifier = account.getIdentifier(IdentityType.ACI);
+    final UUID accountIdentifier = account.getAccountIdentifier();
     addRetrievableAccount(account);
 
     final String targetNumber = "+13102222222";
@@ -1721,10 +1923,279 @@ class AccountsManagerTest {
   }
 
   private void addRetrievableAccount(final Account account) {
-    when(accounts.getByAccountIdentifier(account.getIdentifier(IdentityType.ACI)))
+    when(accounts.getByAccountIdentifier(account.getAccountIdentifier()))
         .thenReturn(Optional.of(account));
 
-    when(accounts.getByAccountIdentifierAsync(account.getIdentifier(IdentityType.ACI)))
+    when(accounts.getByAccountIdentifierAsync(account.getAccountIdentifier()))
         .thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
+  }
+
+  @Nested
+  class Totp {
+
+    @Test
+    void generatePendingTotpKey() throws TooManyTotpKeysException {
+      final UUID accountIdentifier = UUID.randomUUID();
+
+      final Account account = mock(Account.class);
+      when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+
+      when(accounts.getByAccountIdentifier(accountIdentifier))
+          .thenReturn(Optional.of(account));
+
+      final TotpKey pendingTotpKey = accountsManager.generatePendingTotpKey(accountIdentifier);
+
+      verify(account).setPendingTotpKey(pendingTotpKey);
+    }
+
+    @Test
+    void generatePendingTotpKeyTooManyConfirmedKeys() {
+      final UUID accountIdentifier = UUID.randomUUID();
+
+      final Account account = mock(Account.class);
+      when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+
+      when(account.getTotpKeys()).thenReturn(IntStream.range(0, AccountsManager.MAX_TOTP_KEYS)
+          .boxed()
+          .collect(Collectors.toMap(keyId -> keyId, _ -> new AnnotatedTotpKey(
+              new TotpKey(AccountsManager.TOTP_PARAMETERS, TestRandomUtil.nextBytes(16)),
+              TestRandomUtil.nextBytes(16)))));
+
+      when(accounts.getByAccountIdentifier(accountIdentifier))
+          .thenReturn(Optional.of(account));
+
+      assertThrows(TooManyTotpKeysException.class, () -> accountsManager.generatePendingTotpKey(accountIdentifier));
+      verify(account, never()).setPendingTotpKey(any());
+    }
+
+    @Test
+    void confirmPendingTotpKey() throws InvalidKeyException, TooManyTotpKeysException, NoSuchAlgorithmException {
+      final UUID accountIdentifier = UUID.randomUUID();
+
+      final Account account = mock(Account.class);
+      when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+
+      when(accounts.getByAccountIdentifier(accountIdentifier))
+          .thenReturn(Optional.of(account));
+
+      final TotpKey pendingTotpKey = accountsManager.generatePendingTotpKey(accountIdentifier);
+      final int nextTotpKeyId = ThreadLocalRandom.current().nextInt();
+
+      when(account.getPendingTotpKey()).thenReturn(Optional.of(pendingTotpKey));
+      when(account.getNextTotpKeyId()).thenReturn(nextTotpKeyId);
+
+      final TimeBasedOneTimePasswordGenerator totpGenerator =
+          new TimeBasedOneTimePasswordGenerator(AccountsManager.TOTP_PARAMETERS.timeStep(),
+              AccountsManager.TOTP_PARAMETERS.passwordLength(),
+              AccountsManager.TOTP_PARAMETERS.algorithm());
+
+      final Instant timestamp = Instant.now();
+
+      assertEquals(Optional.of(nextTotpKeyId), accountsManager.confirmPendingTotpKey(accountIdentifier,
+          totpGenerator.generateOneTimePassword(pendingTotpKey, timestamp),
+          timestamp,
+          TestRandomUtil.nextBytes(16)));
+
+      verify(account).setPendingTotpKey(null);
+    }
+
+    @Test
+    void confirmPendingTotpKeyPreviouslyConfirmed() throws InvalidKeyException, NoSuchAlgorithmException {
+      final UUID accountIdentifier = UUID.randomUUID();
+
+      final Account account = mock(Account.class);
+      when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+
+      when(accounts.getByAccountIdentifier(accountIdentifier))
+          .thenReturn(Optional.of(account));
+
+      final AnnotatedTotpKey confirmedTotpKey;
+      {
+        final KeyGenerator totpKeyGenerator = KeyGenerator.getInstance(AccountsManager.TOTP_PARAMETERS.algorithm());
+        totpKeyGenerator.init(AccountsManager.TOTP_KEY_LENGTH_BITS);
+
+        confirmedTotpKey = new AnnotatedTotpKey(
+            new TotpKey(AccountsManager.TOTP_PARAMETERS, totpKeyGenerator.generateKey().getEncoded()),
+            TestRandomUtil.nextBytes(16));
+      }
+
+      final int keyId = 17;
+
+      when(account.getPendingTotpKey()).thenReturn(Optional.empty());
+      when(account.getTotpKeys()).thenReturn(Map.of(
+          keyId - 1, confirmedTotpKey,
+          keyId, confirmedTotpKey));
+
+      final TimeBasedOneTimePasswordGenerator totpGenerator =
+          new TimeBasedOneTimePasswordGenerator(AccountsManager.TOTP_PARAMETERS.timeStep(),
+              AccountsManager.TOTP_PARAMETERS.passwordLength(),
+              AccountsManager.TOTP_PARAMETERS.algorithm());
+
+      final Instant timestamp = Instant.now();
+
+      assertEquals(Optional.of(keyId), accountsManager.confirmPendingTotpKey(accountIdentifier,
+          totpGenerator.generateOneTimePassword(confirmedTotpKey, timestamp),
+          timestamp,
+          TestRandomUtil.nextBytes(16)));
+    }
+
+    @Test
+    void confirmPendingTotpKeyNoKeys() throws InvalidKeyException, TooManyTotpKeysException, NoSuchAlgorithmException {
+      final UUID accountIdentifier = UUID.randomUUID();
+
+      final Account account = mock(Account.class);
+      when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+
+      when(accounts.getByAccountIdentifier(accountIdentifier))
+          .thenReturn(Optional.of(account));
+
+      final TotpKey pendingTotpKey = accountsManager.generatePendingTotpKey(accountIdentifier);
+
+      when(account.getPendingTotpKey()).thenReturn(Optional.empty());
+      when(account.getTotpKeys()).thenReturn(Collections.emptyMap());
+
+      final TimeBasedOneTimePasswordGenerator totpGenerator =
+          new TimeBasedOneTimePasswordGenerator(AccountsManager.TOTP_PARAMETERS.timeStep(),
+              AccountsManager.TOTP_PARAMETERS.passwordLength(),
+              AccountsManager.TOTP_PARAMETERS.algorithm());
+
+      final Instant timestamp = Instant.now();
+
+      assertEquals(Optional.empty(), accountsManager.confirmPendingTotpKey(accountIdentifier,
+          totpGenerator.generateOneTimePassword(pendingTotpKey, timestamp),
+          timestamp,
+          TestRandomUtil.nextBytes(16)));
+    }
+
+    @Test
+    void confirmPendingTotpKeyIncorrectPassword()
+        throws InvalidKeyException, TooManyTotpKeysException, NoSuchAlgorithmException {
+      final UUID accountIdentifier = UUID.randomUUID();
+
+      final Account account = mock(Account.class);
+      when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+
+      when(accounts.getByAccountIdentifier(accountIdentifier))
+          .thenReturn(Optional.of(account));
+
+      final TotpKey pendingTotpKey = accountsManager.generatePendingTotpKey(accountIdentifier);
+      final int nextTotpKeyId = ThreadLocalRandom.current().nextInt();
+
+      when(account.getPendingTotpKey()).thenReturn(Optional.of(pendingTotpKey));
+      when(account.getNextTotpKeyId()).thenReturn(nextTotpKeyId);
+
+      final TimeBasedOneTimePasswordGenerator totpGenerator =
+          new TimeBasedOneTimePasswordGenerator(AccountsManager.TOTP_PARAMETERS.timeStep(),
+              AccountsManager.TOTP_PARAMETERS.passwordLength(),
+              AccountsManager.TOTP_PARAMETERS.algorithm());
+
+      final Instant timestamp = Instant.now();
+      final int incorrectPassword = totpGenerator.generateOneTimePassword(pendingTotpKey, timestamp) + 1;
+
+      assertEquals(Optional.empty(), accountsManager.confirmPendingTotpKey(accountIdentifier,
+          incorrectPassword,
+          timestamp,
+          TestRandomUtil.nextBytes(16)));
+
+      verify(account, never()).setPendingTotpKey(null);
+    }
+  }
+
+  @ParameterizedTest
+  @MethodSource
+  void verifyTotp(final Map<Integer, AnnotatedTotpKey> totpKeys,
+      final Instant timestamp,
+      @Nullable final Integer oneTimePassword,
+      final boolean expectVerified) {
+
+    final Account account = mock(Account.class);
+    when(account.getTotpKeys()).thenReturn(totpKeys);
+
+    assertEquals(expectVerified, accountsManager.verifyTotp(account, timestamp, oneTimePassword));
+  }
+
+  private static List<Arguments> verifyTotp() throws NoSuchAlgorithmException, InvalidKeyException {
+    final Instant timestamp = Instant.now();
+
+    final AnnotatedTotpKey totpKey;
+    final AnnotatedTotpKey secondTotpKey;
+    {
+      final KeyGenerator totpKeyGenerator = KeyGenerator.getInstance(AccountsManager.TOTP_PARAMETERS.algorithm());
+      totpKeyGenerator.init(AccountsManager.TOTP_KEY_LENGTH_BITS);
+
+      totpKey = new AnnotatedTotpKey(
+          new TotpKey(AccountsManager.TOTP_PARAMETERS, totpKeyGenerator.generateKey().getEncoded()),
+          TestRandomUtil.nextBytes(16));
+
+      secondTotpKey = new AnnotatedTotpKey(
+          new TotpKey(AccountsManager.TOTP_PARAMETERS, totpKeyGenerator.generateKey().getEncoded()),
+          TestRandomUtil.nextBytes(16));
+    }
+
+    final TimeBasedOneTimePasswordGenerator totpGenerator =
+        new TimeBasedOneTimePasswordGenerator(AccountsManager.TOTP_PARAMETERS.timeStep(),
+            AccountsManager.TOTP_PARAMETERS.passwordLength(),
+            AccountsManager.TOTP_PARAMETERS.algorithm());
+
+    return List.of(
+        Arguments.argumentSet("No keys, no password provided",
+            Collections.emptyMap(), timestamp, null, true),
+
+        Arguments.argumentSet("No keys, password provided",
+            Collections.emptyMap(), timestamp, 123456, false),
+
+        Arguments.argumentSet("Has key, correct password provided",
+            Map.of(1, totpKey), timestamp, totpGenerator.generateOneTimePassword(totpKey, timestamp), true),
+
+        Arguments.argumentSet("Has key, incorrect password provided",
+            Map.of(1, totpKey), timestamp, totpGenerator.generateOneTimePassword(totpKey, timestamp) + 1, false),
+
+        Arguments.argumentSet("Has key, no password provided",
+            Map.of(1, totpKey), timestamp, null, false),
+
+        Arguments.argumentSet("Has multiple keys, correct password provided for one key",
+            Map.of(1, totpKey, 2, secondTotpKey), timestamp, totpGenerator.generateOneTimePassword(totpKey, timestamp), true)
+    );
+  }
+
+  @RepeatedTest(value = 10, failureThreshold = 2)
+  void verifyTotpWithDelay() throws NoSuchAlgorithmException, InvalidKeyException {
+    final AnnotatedTotpKey totpKey;
+    {
+      final KeyGenerator totpKeyGenerator = KeyGenerator.getInstance(AccountsManager.TOTP_PARAMETERS.algorithm());
+      totpKeyGenerator.init(AccountsManager.TOTP_KEY_LENGTH_BITS);
+
+      totpKey = new AnnotatedTotpKey(
+          new TotpKey(AccountsManager.TOTP_PARAMETERS, totpKeyGenerator.generateKey().getEncoded()),
+          TestRandomUtil.nextBytes(16));
+    }
+
+    final TimeBasedOneTimePasswordGenerator totpGenerator =
+        new TimeBasedOneTimePasswordGenerator(AccountsManager.TOTP_PARAMETERS.timeStep(),
+            AccountsManager.TOTP_PARAMETERS.passwordLength(),
+            AccountsManager.TOTP_PARAMETERS.algorithm());
+
+    final Account account = mock(Account.class);
+    when(account.getTotpKeys()).thenReturn(Map.of(1, totpKey));
+
+    final Instant beginningOfTotpWindow =
+        Instant.ofEpochMilli((Instant.now().toEpochMilli() / AccountsManager.TOTP_PARAMETERS.timeStep().toMillis()) *
+            AccountsManager.TOTP_PARAMETERS.timeStep().toMillis());
+
+    final int oneTimePassword = totpGenerator.generateOneTimePassword(totpKey, beginningOfTotpWindow);
+
+    assertTrue(accountsManager.verifyTotp(account, beginningOfTotpWindow, oneTimePassword),
+        "One-time password should be valid at the start of the window in which it was generated");
+
+    assertTrue(accountsManager.verifyTotp(account, beginningOfTotpWindow.plus(AccountsManager.TOTP_PARAMETERS.timeStep()), oneTimePassword),
+        "One-time password should be valid at the start of the window after which it was generated");
+
+    assertTrue(accountsManager.verifyTotp(account, beginningOfTotpWindow.plus(AccountsManager.TOTP_PARAMETERS.timeStep()).plus(MAX_TOTP_VALIDATION_DELAY).minusMillis(1), oneTimePassword),
+        "One-time password should be valid up until max delay after end of current TOTP window");
+
+    // With six-digit OTPs, there's a one-in-a-million chance of this returning a false positive, and so we repeat the
+    // test several allowing for failure
+    assertFalse(accountsManager.verifyTotp(account, beginningOfTotpWindow.plus(AccountsManager.TOTP_PARAMETERS.timeStep()).plus(MAX_TOTP_VALIDATION_DELAY), oneTimePassword),
+        "One-time password should not be valid after max delay past end of current TOTP window");
   }
 }

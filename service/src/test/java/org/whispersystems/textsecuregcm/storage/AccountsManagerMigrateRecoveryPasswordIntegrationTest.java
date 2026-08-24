@@ -141,7 +141,8 @@ public class AccountsManagerMigrateRecoveryPasswordIntegrationTest {
           executor,
           executor,
           mock(Clock.class),
-          "link-device-secret".getBytes(StandardCharsets.UTF_8));
+          "link-device-secret".getBytes(StandardCharsets.UTF_8),
+          AccountsManager.TOTP_PARAMETERS.timeStep().dividedBy(2));
     }
   }
 
@@ -165,7 +166,7 @@ public class AccountsManagerMigrateRecoveryPasswordIntegrationTest {
             .setDeviceAttributes(new DeviceAttributes(false, 1, 1, new byte[0], Collections.emptySet())))
         .build();
 
-    final UUID phoneNumberIdentifier = account.getPhoneNumberIdentifierOptional().orElseThrow();
+    final UUID phoneNumberIdentifier = account.getPhoneNumberIdentifier().orElseThrow();
     final byte[] recoveryPassword = TestRandomUtil.nextBytes(16);
 
     phoneNumberRecoveryPasswordsManager.store(phoneNumberIdentifier, recoveryPassword);
