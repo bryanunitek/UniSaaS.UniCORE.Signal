@@ -20,10 +20,9 @@
     <java-jwt.version>4.6.0</java-jwt.version>
     <java-uuid-generator.version>5.2.0</java-uuid-generator.version>
     <!-- *all* opentelemetry-logback-appender versions are "alpha" despite the advanced version number -->
-    <opentelemetry-logback-appender-1.0.version>2.30.0-alpha</opentelemetry-logback-appender-1.0.version>
+    <opentelemetry-logback-appender-1.0.version>2.31.1-alpha</opentelemetry-logback-appender-1.0.version>
     <storekit.version>5.2.0</storekit.version>
     <webauthn4j.version>0.31.9.RELEASE</webauthn4j.version>
-    <jetty.http2-client.version>12.1.12</jetty.http2-client.version>
   </properties>
 
   <dependencies>
@@ -147,7 +146,6 @@
       <groupId>org.eclipse.jetty.http2</groupId>
       <artifactId>jetty-http2-client-transport</artifactId>
       <scope>test</scope>
-      <version>${jetty.http2-client.version}</version>
     </dependency>
     <dependency>
       <groupId>io.dropwizard</groupId>
@@ -190,6 +188,7 @@
     <dependency>
       <groupId>tools.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
+      <!-- update dependabot.yml when this dependency is removed -->
       <version>3.2.1</version>
     </dependency>
 
@@ -641,6 +640,7 @@
     <dependency>
       <groupId>com.squareup.okio</groupId>
       <artifactId>okio-jvm</artifactId>
+      <!-- update dependabot.yml when this dependency is removed -->
       <version>3.17.0</version>
     </dependency>
 

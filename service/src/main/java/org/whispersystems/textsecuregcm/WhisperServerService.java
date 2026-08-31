@@ -207,7 +207,6 @@ import org.whispersystems.textsecuregcm.limits.RedisMessageDeliveryLoopMonitor;
 import org.whispersystems.textsecuregcm.mappers.BackupExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.CompletionExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.DeviceLimitExceededExceptionMapper;
-import org.whispersystems.textsecuregcm.mappers.GrpcStatusRuntimeExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.IOExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.IllegalStateExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.ImpossiblePhoneNumberExceptionMapper;
@@ -273,14 +272,14 @@ import org.whispersystems.textsecuregcm.storage.OneTimeDonationsManager;
 import org.whispersystems.textsecuregcm.storage.PagedSingleUseKEMPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.PersistentTimer;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberIdentifiers;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswords;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.ProfileAvatars;
 import org.whispersystems.textsecuregcm.storage.Profiles;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.ProfilesV2;
 import org.whispersystems.textsecuregcm.storage.PushChallengeDynamoDb;
 import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
-import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswords;
-import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.RemoteConfigs;
 import org.whispersystems.textsecuregcm.storage.RemoteConfigsManager;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseECSignedPreKeyStore;
@@ -328,6 +327,7 @@ import org.whispersystems.textsecuregcm.workers.CertificateCommand;
 import org.whispersystems.textsecuregcm.workers.CheckDynamicConfigurationCommand;
 import org.whispersystems.textsecuregcm.workers.ClearExpiredFoundationDbMessagesCommand;
 import org.whispersystems.textsecuregcm.workers.ClearIssuedReceiptRedemptionsCommand;
+import org.whispersystems.textsecuregcm.workers.ClearOrphanedFoundationDbQueuesCommand;
 import org.whispersystems.textsecuregcm.workers.CopyToS3Command;
 import org.whispersystems.textsecuregcm.workers.DeleteUserCommand;
 import org.whispersystems.textsecuregcm.workers.IdleDeviceNotificationSchedulerFactory;
@@ -406,6 +406,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     bootstrap.addCommand(new CopyToS3Command());
     bootstrap.addCommand(new ClearExpiredFoundationDbMessagesCommand(Clock.systemUTC()));
     bootstrap.addCommand(new TrimOversizedFoundationDbMessageQueuesCommand());
+    bootstrap.addCommand(new ClearOrphanedFoundationDbQueuesCommand());
 
     bootstrap.addCommand(new ProcessScheduledJobsServiceCommand("process-idle-device-notification-jobs",
         "Processes scheduled jobs to send notifications to idle devices",
@@ -939,6 +940,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         config.getCdnConfiguration().credentials().secretAccessKey().value());
 
     ServerSecretParams groupZkSecretParams = new ServerSecretParams(config.getGroupsZkConfig().serverSecret().value());
+    GenericServerSecretParams callingPreV101GenericZkSecretParams = new GenericServerSecretParams(config.getCallingZkConfigPreV101().serverSecret().value());
     GenericServerSecretParams callingGenericZkSecretParams = new GenericServerSecretParams(config.getCallingZkConfig().serverSecret().value());
     GenericServerSecretParams chatGenericZkSecretParams = new GenericServerSecretParams(config.getChatZkConfig().serverSecret().value());
     ServerZkProfileOperations zkProfileOperations = new ServerZkProfileOperations(groupZkSecretParams);
@@ -1180,11 +1182,14 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     unauthenticatedServices.forEach(serverBuilder::addService);
     final ManagedGrpcServer localGrpcServer = new ManagedGrpcServer(serverBuilder.build());
 
+    final String websocketServletPath = "/v1/websocket/";
+    final String provisioningWebsocketServletPath = "/v1/websocket/provisioning/";
+
     final SocketAddress websocketAddress =
         new InetSocketAddress(config.getGrpc().websocketAddress(), config.getGrpc().websocketPort());
-    final OmnibusRouter omnibusRouter = new OmnibusRouter(List.of(
-        new OmnibusRouter.OmnibusRoute("/v1/websocket", websocketAddress),
-        new OmnibusRouter.OmnibusRoute("/v1/provisioning", websocketAddress)),
+    final OmnibusRouter omnibusRouter = new OmnibusRouter(Map.of(
+        websocketServletPath, websocketAddress,
+        provisioningWebsocketServletPath, websocketAddress),
         grpcLocalAddress);
     @Nullable final Mapping<String, SslContext> sniMapping = config.getGrpc().h2c()
         ? null
@@ -1214,9 +1219,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new BasicCredentialAuthFilter.Builder<AuthenticatedDevice>()
             .setAuthenticator(accountAuthenticator)
             .buildAuthFilter();
-
-    final String websocketServletPath = "/v1/websocket/";
-    final String provisioningWebsocketServletPath = "/v1/websocket/provisioning/";
 
     MetricsHttpEventHandler.configure(environment, Metrics.globalRegistry, clientReleaseManager, Set.of(websocketServletPath, provisioningWebsocketServletPath, "/health-check"));
 
@@ -1267,9 +1269,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             experimentEnrollmentManager, config.getAttachments().maxAttachmentUploadSizeInBytes()),
         new ArchiveController(accountsManager, backupAuthManager, backupManager, backupMetrics, config.getAttachments().maxAttachmentUploadSizeInBytes(), config.getAttachments().maxMessageBackupUploadSizeInBytes()),
         new CallRoutingControllerV2(rateLimiters, cloudflareTurnCredentialsManager),
-        new CallLinkController(rateLimiters, callingGenericZkSecretParams),
+        new CallLinkController(rateLimiters, callingGenericZkSecretParams, callingPreV101GenericZkSecretParams),
         new CallQualitySurveyController(callQualitySurveyManager),
-        new CertificateController(accountsManager, certificateGenerator, zkAuthOperations, callingGenericZkSecretParams, clock),
+        new CertificateController(accountsManager, certificateGenerator, zkAuthOperations, callingGenericZkSecretParams, callingPreV101GenericZkSecretParams, clock),
         new ChallengeController(accountsManager, rateLimitChallengeManager, challengeConstraintChecker),
         new DeviceController(accountsManager, rateLimiters, persistentTimer),
         new DeviceCheckController(clock, accountsManager, backupAuthManager, appleDeviceCheckManager, rateLimiters,
@@ -1364,7 +1366,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     List.of(
         new LoggingUnhandledExceptionMapper(),
         new CompletionExceptionMapper(),
-        new GrpcStatusRuntimeExceptionMapper(),
         new IOExceptionMapper(),
         new RateLimitExceededExceptionMapper(),
         new InvalidWebsocketAddressExceptionMapper(),

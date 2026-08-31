@@ -8,7 +8,6 @@ package org.whispersystems.textsecuregcm.storage;
 import static java.util.Objects.requireNonNull;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
-import com.eatthepath.otp.HmacOneTimePasswordGenerator;
 import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectWriter;
@@ -61,7 +60,6 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import javax.annotation.Nullable;
 import javax.crypto.KeyGenerator;
 import javax.crypto.Mac;
@@ -151,7 +149,6 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   private final Duration maxTotpValidationDelay;
 
   private final KeyGenerator totpKeyGenerator;
-  private final TimeBasedOneTimePasswordGenerator totpGenerator;
 
   private final Key verificationTokenKey;
 
@@ -207,13 +204,10 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   static final String LINK_DEVICE_VERIFICATION_TOKEN_ALGORITHM = "HmacSHA256";
 
   @VisibleForTesting
-  static final int TOTP_KEY_LENGTH_BITS = 256;
+  public static final TimeBasedOneTimePasswordGenerator TOTP = new TimeBasedOneTimePasswordGenerator();
 
-  @VisibleForTesting
-  public static final TotpParameters TOTP_PARAMETERS = new TotpParameters(
-      TimeBasedOneTimePasswordGenerator.TOTP_ALGORITHM_HMAC_SHA256,
-      HmacOneTimePasswordGenerator.DEFAULT_PASSWORD_LENGTH,
-      TimeBasedOneTimePasswordGenerator.DEFAULT_TIME_STEP);
+  private static final TotpParameters TOTP_PARAMETERS =
+      new TotpParameters(TOTP.getAlgorithm(), TOTP.getPasswordLength(), TOTP.getTimeStep());
 
   public static final int MAX_TOTP_KEYS = 2;
 
@@ -325,7 +319,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     this.retryExecutor = retryExecutor;
     this.clock = requireNonNull(clock);
 
-    if (maxTotpValidationDelay.compareTo(TOTP_PARAMETERS.timeStep()) > 0) {
+    if (maxTotpValidationDelay.compareTo(TOTP.getTimeStep()) > 0) {
       throw new IllegalArgumentException("Max TOTP validation delay must be less than or equal to TOTP time step");
     }
 
@@ -341,21 +335,23 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     }
 
     try {
-      this.totpKeyGenerator = KeyGenerator.getInstance(TOTP_PARAMETERS.algorithm());
-      totpKeyGenerator.init(TOTP_KEY_LENGTH_BITS);
+      this.totpKeyGenerator = KeyGenerator.getInstance(TOTP.getAlgorithm());
+      totpKeyGenerator.init(getTotpKeyLengthBits());
     } catch (final NoSuchAlgorithmException e) {
       throw new AssertionError("Every implementation of the Java platform is required to support the HmacSHA256 KeyGenerator algorithm", e);
     }
 
-    try {
-      this.totpGenerator = new TimeBasedOneTimePasswordGenerator(TOTP_PARAMETERS.timeStep(),
-          TOTP_PARAMETERS.passwordLength(),
-          TOTP_PARAMETERS.algorithm());
-    } catch (final NoSuchAlgorithmException e) {
-      throw new AssertionError("Every implementation of the Java platform is required to support the HmacSHA256 MAC algorithm", e);
-    }
-
     this.pubSubConnection = pubSubRedisClient.createPubSubConnection();
+  }
+
+  @VisibleForTesting
+  static int getTotpKeyLengthBits() {
+    try {
+      // The HOTP/TOTP spec recommends using a key length that's the same as the HMAC block length
+      return Mac.getInstance(TOTP.getAlgorithm()).getMacLength() * 8;
+    } catch (final NoSuchAlgorithmException e) {
+      throw new AssertionError("Algorithm used by TOTP generator not found", e);
+    }
   }
 
   @Override
@@ -2060,7 +2056,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   /// otherwise
   ///
   /// @see [#generatePendingTotpKey(UUID)
-  public Optional<Integer> confirmPendingTotpKey(final UUID accountIdentifier,
+  public Optional<Byte> confirmPendingTotpKey(final UUID accountIdentifier,
       final int oneTimePassword,
       final Instant timestamp,
       final byte[] metadataCiphertext) {
@@ -2077,22 +2073,22 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final TotpKey pendingTotpKey = maybePendingTotpKey.get();
 
       try {
-        if (totpGenerator.validateOneTimePassword(pendingTotpKey, timestamp, oneTimePassword)) {
+        if (TOTP.validateOneTimePassword(pendingTotpKey, timestamp, oneTimePassword)) {
           final AtomicInteger keyId = new AtomicInteger();
 
           update(accountIdentifier, account -> {
-            final Map<Integer, AnnotatedTotpKey> updatedTotpKeys = new HashMap<>(account.getTotpKeys());
+            final Map<Byte, AnnotatedTotpKey> updatedTotpKeys = new HashMap<>(account.getTotpKeys());
 
             keyId.set(account.getNextTotpKeyId());
 
-            updatedTotpKeys.put(keyId.get(),
+            updatedTotpKeys.put((byte) keyId.get(),
                 new AnnotatedTotpKey(new TotpKey(pendingTotpKey.totpParameters(), pendingTotpKey.encodedKey()), metadataCiphertext));
 
             account.setPendingTotpKey(null);
             account.setTotpKeys(updatedTotpKeys);
           });
 
-          return Optional.of(keyId.get());
+          return Optional.of((byte) keyId.get());
         }
       } catch (final InvalidKeyException e) {
         ImpossibleEvents.logImpossible(logger, "Invalid pending TOTP key for account {}", accountIdentifier, e);
@@ -2113,7 +2109,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
             .max(Map.Entry.comparingByKey())
             .filter(entry -> {
               try {
-                return totpGenerator.validateOneTimePassword(entry.getValue(), timestamp, oneTimePassword);
+                return TOTP.validateOneTimePassword(entry.getValue(), timestamp, oneTimePassword);
               } catch (final InvalidKeyException e) {
                 ImpossibleEvents.logImpossible(logger, "Invalid TOTP key for account {}", accountIdentifier, e);
                 return false;
@@ -2135,7 +2131,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     for (final Instant timestamp : new Instant[] { validationTimestamp, validationTimestamp.minus(maxTotpValidationDelay) }) {
       for (final SecretKey totpKey : account.getTotpKeys().values()) {
         try {
-          if (totpGenerator.validateOneTimePassword(totpKey, timestamp, oneTimePassword)) {
+          if (TOTP.validateOneTimePassword(totpKey, timestamp, oneTimePassword)) {
             return true;
           }
         } catch (final InvalidKeyException e) {
