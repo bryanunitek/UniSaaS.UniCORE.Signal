@@ -49,7 +49,7 @@ import org.whispersystems.textsecuregcm.util.ZkCredentialPublicKeyAdapter;
 @JsonFilter("Account")
 public class Account {
 
-  public static final int MAX_TOTP_KEY_ID = Byte.MAX_VALUE;
+  public static final int MAX_MFA_KEY_ID = Byte.MAX_VALUE;
 
   private static final Logger logger = LoggerFactory.getLogger(Account.class);
 
@@ -165,8 +165,8 @@ public class Account {
   @Nullable
   private TotpKey pendingTotpKey;
 
-  @JsonProperty("totp")
-  private Map<Byte, AnnotatedTotpKey> totpKeys = Collections.emptyMap();
+  @JsonProperty("mfa")
+  private Map<Byte, AnnotatedMfaKey> mfaKeys = Collections.emptyMap();
 
   @JsonIgnore
   private boolean stale;
@@ -475,10 +475,11 @@ public class Account {
     }
   }
 
-  public void setRegistrationLock(final String registrationLock, final String registrationLockSalt) {
+  public void setRegistrationLock(@Nullable final String registrationLock, @Nullable final String registrationLockSalt) {
     requireNotStale();
 
-    if (number == null) {
+    // Accounts without a phone number can't set a registration lock
+    if (number == null && (registrationLock != null || registrationLockSalt != null)) {
       throw new IllegalArgumentException("Cannot set registration lock on account with no phone number");
     }
 
@@ -673,25 +674,25 @@ public class Account {
     return Optional.ofNullable(pendingTotpKey);
   }
 
-  public byte getNextTotpKeyId() {
+  public byte getNextMfaKeyId() {
     requireNotStale();
 
-    final Set<Byte> usedKeys = new HashSet<>(totpKeys.keySet());
+    final Set<Byte> usedKeys = new HashSet<>(mfaKeys.keySet());
 
-    return (byte) IntStream.range(0, MAX_TOTP_KEY_ID + 1)
+    return (byte) IntStream.range(0, MAX_MFA_KEY_ID + 1)
         .filter(b -> !usedKeys.contains((byte) b))
         .findFirst()
         .orElseThrow(IllegalStateException::new);
   }
 
-  public Map<Byte, AnnotatedTotpKey> getTotpKeys() {
+  public Map<Byte, AnnotatedMfaKey> getMfaKeys() {
     requireNotStale();
-    return totpKeys;
+    return mfaKeys;
   }
 
-  public void setTotpKeys(final Map<Byte, AnnotatedTotpKey> totpKeys) {
+  public void setMfaKeys(final Map<Byte, AnnotatedMfaKey> mfaKeys) {
     requireNotStale();
-    this.totpKeys = totpKeys;
+    this.mfaKeys = mfaKeys;
   }
 
   public void markStale() {

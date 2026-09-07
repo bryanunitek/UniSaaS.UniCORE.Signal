@@ -50,7 +50,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -142,7 +141,6 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   private final SecureValueRecoveryClient secureValueRecovery2Client;
   private final DisconnectionRequestManager disconnectionRequestManager;
   private final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager;
-  private final Executor accountLockExecutor;
   private final ScheduledExecutorService messagesPollExecutor;
   private final ScheduledExecutorService retryExecutor;
   private final Clock clock;
@@ -210,6 +208,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       new TotpParameters(TOTP.getAlgorithm(), TOTP.getPasswordLength(), TOTP.getTimeStep());
 
   public static final int MAX_TOTP_KEYS = 2;
+  public static final int MAX_MFA_KEYS = 10;
 
   public enum DeletionReason {
     ADMIN_DELETED("admin"),
@@ -282,6 +281,9 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   private static class UncheckedTooManyTotpKeysException extends NoStackTraceRuntimeException {
   }
 
+  private static class UncheckedTooManyMfaKeysException extends NoStackTraceRuntimeException {
+  }
+
   public AccountsManager(final Accounts accounts,
       final PhoneNumberIdentifiers phoneNumberIdentifiers,
       final FaultTolerantRedisClusterClient cacheCluster,
@@ -295,7 +297,6 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final SecureValueRecoveryClient secureValueRecovery2Client,
       final DisconnectionRequestManager disconnectionRequestManager,
       final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager,
-      final Executor accountLockExecutor,
       final ScheduledExecutorService messagesPollExecutor,
       final ScheduledExecutorService retryExecutor,
       final Clock clock,
@@ -314,7 +315,6 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     this.secureValueRecovery2Client = secureValueRecovery2Client;
     this.disconnectionRequestManager = disconnectionRequestManager;
     this.phoneNumberRecoveryPasswordsManager = requireNonNull(phoneNumberRecoveryPasswordsManager);
-    this.accountLockExecutor = accountLockExecutor;
     this.messagesPollExecutor = messagesPollExecutor;
     this.retryExecutor = retryExecutor;
     this.clock = requireNonNull(clock);
@@ -450,7 +450,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     return Metrics.timer(CREATE_TIMER_NAME, HAS_NUMBER_TAG_NAME, "true").record(() -> {
       try {
         return accountLockManager.withLock(Set.of(pni),
-            () -> create(Optional.of(number), Optional.of(pni), Optional.empty(), Optional.empty(), accountAttributes, aciIdentityKey, Optional.of(pniIdentityKey), primaryDeviceSpec, userAgent), accountLockExecutor);
+            () -> create(Optional.of(number), Optional.of(pni), Optional.empty(), Optional.empty(), accountAttributes, aciIdentityKey, Optional.of(pniIdentityKey), primaryDeviceSpec, userAgent));
       } catch (final ReceiptAlreadyRedeemedException e) {
         throw new AssertionError("ReceiptAlreadyRedeemedException must never be thrown for accounts with numbers");
       } catch (final RuntimeException e) {
@@ -518,7 +518,15 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
               additionalWriteItems.add(phoneNumberRecoveryPasswordsManager.buildTransactWriteItemForStorePassword(phoneNumberIdentifier, phoneNumberRecoveryPassword))));
 
       if (maybeNumber.isPresent()) {
-        accounts.create(account, additionalWriteItems);
+        if (maybeRecentlyDeletedAccountIdentifier.isPresent()) {
+          // If we are re-using a recently deleted ACI, also obtain a lock for it so that clearing queues for the ACI synchronize against it
+          accountLockManager.withLock(Set.of(maybeRecentlyDeletedAccountIdentifier.get()), () -> {
+            accounts.create(account, additionalWriteItems);
+            return null;
+          });
+        } else {
+          accounts.create(account, additionalWriteItems);
+        }
       } else {
         assert accountAttributes.recoveryPassword().isPresent();
         accounts.create(account,
@@ -601,7 +609,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       reclaimAccount(account, existingAccount, primaryDeviceSpec, accountAttributes);
 
       return account;
-    }, accountLockExecutor);
+    });
 
     final PushTokenType pushTokenType = PushTokenType.fromDeviceSpec(primaryDeviceSpec);
     final PushTokenType previousPushTokenType = PushTokenType.fromDevice(existingAccount.getPrimaryDevice());
@@ -699,8 +707,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
         .orElseThrow(() -> new IllegalArgumentException("Account not found: " + accountIdentifier));
 
     return accountLockManager.withSingleAccountLock(account,
-        () -> addDevice(accountIdentifier, deviceSpec, linkDeviceToken, MAX_UPDATE_ATTEMPTS),
-        accountLockExecutor);
+        () -> addDevice(accountIdentifier, deviceSpec, linkDeviceToken, MAX_UPDATE_ATTEMPTS));
   }
 
   private Pair<Account, Device> addDevice(final UUID accountIdentifier, final DeviceSpec deviceSpec, final String linkDeviceToken, final int retries)
@@ -897,8 +904,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
         .orElseThrow(() -> new IllegalArgumentException("Account not found: " + accountIdentifier));
 
     return accountLockManager.withSingleAccountLock(account,
-        () -> removeDevice(accountIdentifier, deviceId, MAX_UPDATE_ATTEMPTS),
-        accountLockExecutor);
+        () -> removeDevice(accountIdentifier, deviceId, MAX_UPDATE_ATTEMPTS));
   }
 
   private Account removeDevice(final UUID accountIdentifier, final byte deviceId, final int retries) {
@@ -964,7 +970,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
     try {
       return accountLockManager.withLock(new HashSet<>(List.of(originalPhoneNumberIdentifier, targetPhoneNumberIdentifier)),
-          () -> changeNumber(account, targetNumber, targetPhoneNumberIdentifier, pniIdentityKey, pniSignedPreKeys, pniPqLastResortPreKeys, pniRegistrationIds), accountLockExecutor);
+          () -> changeNumber(account, targetNumber, targetPhoneNumberIdentifier, pniIdentityKey, pniSignedPreKeys, pniPqLastResortPreKeys, pniRegistrationIds));
     } catch (final RuntimeException e) {
       logger.error("Unexpected exception when changing phone number", e);
       throw e;
@@ -1268,7 +1274,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       }
 
       return maybeUpdatedAccount;
-    }, accountLockExecutor);
+    });
   }
 
   /**
@@ -1476,7 +1482,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       accountLockManager.withSingleAccountLock(account, () -> {
         delete(account);
         return null;
-      }, accountLockExecutor);
+      });
 
       Metrics.counter(DELETE_COUNTER_NAME,
               COUNTRY_CODE_TAG_NAME, Util.getCountryCode(account),
@@ -1990,7 +1996,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     accountLockManager.withSingleAccountLock(account, () -> {
       migrateAccountRecoveryPassword(account.getAccountIdentifier(), MAX_UPDATE_ATTEMPTS);
       return null;
-    }, accountLockExecutor);
+    });
   }
 
   private void migrateAccountRecoveryPassword(final UUID accountIdentifier, final int retries) {
@@ -2025,20 +2031,25 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   /// @see [#confirmPendingTotpKey(UUID, int, Instant, byte[])
   ///
   /// @throws TooManyTotpKeysException if the target account already has at least [#MAX_TOTP_KEYS] TOTP keys
-  public TotpKey generatePendingTotpKey(final UUID accountIdentifier) throws TooManyTotpKeysException {
+  /// @throws TooManyMfaKeysException if the target account already has at least [#MAX_MFA_KEYS] total MFA keys
+  public TotpKey generatePendingTotpKey(final UUID accountIdentifier) throws TooManyTotpKeysException, TooManyMfaKeysException {
     final SecretKey secretKey = totpKeyGenerator.generateKey();
     final TotpKey pendingTotpKey = new TotpKey(TOTP_PARAMETERS, secretKey.getEncoded());
 
     try {
       update(accountIdentifier, account -> {
-        if (account.getTotpKeys().size() >= MAX_TOTP_KEYS) {
+        if (account.getMfaKeys().values().stream().filter(AnnotatedTotpKey.class::isInstance).count() >= MAX_TOTP_KEYS) {
           throw new UncheckedTooManyTotpKeysException();
+        } else if (account.getMfaKeys().size() >= MAX_MFA_KEYS) {
+          throw new UncheckedTooManyMfaKeysException();
         }
 
         account.setPendingTotpKey(pendingTotpKey);
       });
     } catch (final UncheckedTooManyTotpKeysException _) {
       throw new TooManyTotpKeysException();
+    } catch (final UncheckedTooManyMfaKeysException _) {
+      throw new TooManyMfaKeysException();
     }
 
     return pendingTotpKey;
@@ -2055,11 +2066,13 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   /// TOTP password for the given account or for a one-time password previously verified for the given account or empty
   /// otherwise
   ///
+  /// @throws TooManyMfaKeysException if the target account already has at least [#MAX_MFA_KEYS] total MFA keys
+  ///
   /// @see [#generatePendingTotpKey(UUID)
   public Optional<Byte> confirmPendingTotpKey(final UUID accountIdentifier,
       final int oneTimePassword,
       final Instant timestamp,
-      final byte[] metadataCiphertext) {
+      final byte[] metadataCiphertext) throws TooManyMfaKeysException {
 
     final Optional<Account> maybeAccount = accounts.getByAccountIdentifier(accountIdentifier);
 
@@ -2073,25 +2086,31 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final TotpKey pendingTotpKey = maybePendingTotpKey.get();
 
       try {
-        if (TOTP.validateOneTimePassword(pendingTotpKey, timestamp, oneTimePassword)) {
+        if (verifyTotp(pendingTotpKey, timestamp, oneTimePassword)) {
           final AtomicInteger keyId = new AtomicInteger();
 
           update(accountIdentifier, account -> {
-            final Map<Byte, AnnotatedTotpKey> updatedTotpKeys = new HashMap<>(account.getTotpKeys());
+            final Map<Byte, AnnotatedMfaKey> updatedMfaKeys = new HashMap<>(account.getMfaKeys());
 
-            keyId.set(account.getNextTotpKeyId());
+            if (updatedMfaKeys.size() >= MAX_MFA_KEYS) {
+              throw new UncheckedTooManyMfaKeysException();
+            }
 
-            updatedTotpKeys.put((byte) keyId.get(),
+            keyId.set(account.getNextMfaKeyId());
+
+            updatedMfaKeys.put((byte) keyId.get(),
                 new AnnotatedTotpKey(new TotpKey(pendingTotpKey.totpParameters(), pendingTotpKey.encodedKey()), metadataCiphertext));
 
             account.setPendingTotpKey(null);
-            account.setTotpKeys(updatedTotpKeys);
+            account.setMfaKeys(updatedMfaKeys);
           });
 
           return Optional.of((byte) keyId.get());
         }
       } catch (final InvalidKeyException e) {
         ImpossibleEvents.logImpossible(logger, "Invalid pending TOTP key for account {}", accountIdentifier, e);
+      } catch (final UncheckedTooManyMfaKeysException _) {
+        throw new TooManyMfaKeysException();
       }
     }
 
@@ -2105,11 +2124,12 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     // possible that a user will have iterated through so many keys that they've wrapped around into negative integers,
     // but that's not really a practical concern.
     return getByAccountIdentifier(accountIdentifier)
-        .flatMap(account -> account.getTotpKeys().entrySet().stream()
+        .flatMap(account -> account.getMfaKeys().entrySet().stream()
+            .filter(entry -> entry.getValue() instanceof AnnotatedTotpKey)
             .max(Map.Entry.comparingByKey())
             .filter(entry -> {
               try {
-                return TOTP.validateOneTimePassword(entry.getValue(), timestamp, oneTimePassword);
+                return verifyTotp((AnnotatedTotpKey) entry.getValue(), timestamp, oneTimePassword);
               } catch (final InvalidKeyException e) {
                 ImpossibleEvents.logImpossible(logger, "Invalid TOTP key for account {}", accountIdentifier, e);
                 return false;
@@ -2119,7 +2139,8 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   }
 
   public boolean verifyTotp(final Account account, final Instant validationTimestamp, @Nullable final Integer oneTimePassword) {
-    if (account.getTotpKeys().isEmpty()) {
+    final List<AnnotatedTotpKey> totpKeys = account.getMfaKeys().values().stream().filter(AnnotatedTotpKey.class::isInstance).map(AnnotatedTotpKey.class::cast).toList();
+    if (totpKeys.isEmpty()) {
       return oneTimePassword == null;
     }
 
@@ -2128,18 +2149,25 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       return false;
     }
 
-    for (final Instant timestamp : new Instant[] { validationTimestamp, validationTimestamp.minus(maxTotpValidationDelay) }) {
-      for (final SecretKey totpKey : account.getTotpKeys().values()) {
-        try {
-          if (TOTP.validateOneTimePassword(totpKey, timestamp, oneTimePassword)) {
-            return true;
-          }
-        } catch (final InvalidKeyException e) {
-          ImpossibleEvents.logImpossible(logger, "Invalid TOTP key for account {}", account.getAccountIdentifier(), e);
+    for (final SecretKey totpKey : totpKeys) {
+      try {
+        if (verifyTotp(totpKey, validationTimestamp, oneTimePassword)) {
+          return true;
         }
+      } catch (final InvalidKeyException e) {
+        ImpossibleEvents.logImpossible(logger, "Invalid TOTP key for account {}", account.getAccountIdentifier(), e);
       }
     }
 
+    return false;
+  }
+
+  private boolean verifyTotp(final SecretKey totpKey, final Instant validationTimestamp, final int oneTimePassword) throws InvalidKeyException {
+    for (final Instant timestamp : new Instant[]{validationTimestamp, validationTimestamp.minus(maxTotpValidationDelay)}) {
+        if (TOTP.validateOneTimePassword(totpKey, timestamp, oneTimePassword)) {
+          return true;
+        }
+    }
     return false;
   }
 }

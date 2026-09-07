@@ -6,7 +6,6 @@ package org.whispersystems.textsecuregcm.storage;
 
 import static java.util.Objects.requireNonNull;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
-import static org.whispersystems.textsecuregcm.util.Util.getAlternateForms;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectWriter;
@@ -339,11 +338,17 @@ public class Accounts {
               // The account was already deleted, and we don't allow re-registering with the same receipt
               .orElseThrow(ReceiptAlreadyRedeemedException::new);
 
-          // If the account recovery password in the request matches the existing account, this is likely a client retry,
-          // and we continue to allow for idempotency, otherwise this is an attempt to double-redeem a receipt
-          final boolean isRetry = existingAccount.getAccountRecoveryPassword()
+          final boolean accountRecoveryPasswordMatches = existingAccount.getAccountRecoveryPassword()
               .map(arp -> PhoneNumberRecoveryPasswordsManager.verify(arp, accountRecoveryPasswordInRequest))
               .orElse(false);
+
+          // Determine if this request is safe to idempotently succeed. It's safe if:
+          // - The account recovery password in the request matches the existing account's
+          // - The existing account does not have any MFA keys. If MFA keys were added to the account the caller should
+          //   have used numberless account recovery rather than using their original receipt
+          //
+          // If either of these conditions are not met, the caller is incorrectly using an already redeemed receipt.
+          final boolean isRetry = accountRecoveryPasswordMatches && existingAccount.getMfaKeys().isEmpty();
 
           if (!isRetry) {
             throw new ReceiptAlreadyRedeemedException();
@@ -410,9 +415,9 @@ public class Accounts {
       accountToCreate.setZkCredentialKey(existingAccount.getZkCredentialKey().orElse(null));
       accountToCreate.setZkCredentialKeyRotationId(existingAccount.getZkCredentialKeyRotationId());
 
-      // Carry over any existing TOTP keys to the new account; we don't need to copy the pending TOTP key since that's
+      // Carry over any existing MFA keys to the new account; we don't need to copy the pending TOTP key since that's
       // just a temporary holding place for essentially ephemeral data
-      accountToCreate.setTotpKeys(new HashMap<>(existingAccount.getTotpKeys()));
+      accountToCreate.setMfaKeys(new HashMap<>(existingAccount.getMfaKeys()));
 
       final List<TransactWriteItem> writeItems = new ArrayList<>();
 
@@ -468,7 +473,7 @@ public class Accounts {
           && accountToCreate.getNumber().isPresent()) {
         final String existingAccountNumber = existingAccount.getNumber().get();
         final String accountToCreateNumber = accountToCreate.getNumber().get();
-        if (getAlternateForms(existingAccountNumber).contains(accountToCreateNumber)) {
+        if (Util.getAlternateForms(existingAccountNumber).contains(accountToCreateNumber)) {
           final AttributeValue uuidAttr = AttributeValues.fromUUID(existingAccount.getAccountIdentifier());
           final AttributeValue numberAttr = AttributeValues.fromString(accountToCreateNumber);
           final TransactWriteItem phoneNumberConstraintPut = buildConstraintTablePutIfAbsent(
@@ -1094,7 +1099,7 @@ public class Accounts {
             setClauses.add("#number = :number");
 
             final MembershipExpression membershipExpression = maybeExpectedExistingE164
-                .map(e164 -> MembershipExpression.build(getAlternateForms(e164)))
+                .map(e164 -> MembershipExpression.build(Util.getAlternateForms(e164)))
                 .orElseThrow(() -> new IllegalArgumentException("E164 must be present on existing account"));
 
             attrValues.putAll(membershipExpression.values());

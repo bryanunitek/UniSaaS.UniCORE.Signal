@@ -481,7 +481,6 @@ class AccountsTest {
     assertThat(account.getReservedUsernameHash()).isEmpty();
   }
 
-  @SuppressWarnings("unused")
   static ArgumentSets reclaimAccountWithNoUsername() {
     return ArgumentSets.argumentsForFirstParameter(UsernameStatus.values())
         // number
@@ -557,6 +556,31 @@ class AccountsTest {
     assertThat(reclaimed.getZkCredentialKey()).hasValue(existingAccount.getZkCredentialKey().orElseThrow());
   }
 
+  @Test
+  void testIdempotentCreationWithMfaFails() throws Exception {
+    final UUID existingUuid = UUID.randomUUID();
+    final byte[] accountRecoveryPassword = TestRandomUtil.nextBytes(16);
+    final Account existingAccount =
+        generateAccount(null, existingUuid, null, List.of(generateDevice(DEVICE_ID_1)), accountRecoveryPassword);
+
+    existingAccount.setMfaKeys(Map.of((byte) 1, new AnnotatedTotpKey(new TotpKey(
+        new TotpParameters(
+            TimeBasedOneTimePasswordGenerator.TOTP_ALGORITHM_HMAC_SHA1,
+            HmacOneTimePasswordGenerator.DEFAULT_PASSWORD_LENGTH,
+            TimeBasedOneTimePasswordGenerator.DEFAULT_TIME_STEP),
+        TestRandomUtil.nextBytes(16)),
+        TestRandomUtil.nextBytes(16))));
+
+    final ReceiptCredentialPresentation receiptCredentialPresentation = receiptPresentation();
+    createNumberlessAccount(existingAccount, receiptCredentialPresentation, accountRecoveryPassword);
+
+    final Account secondAccount =
+        generateAccount(null, UUID.randomUUID(), null, List.of(generateDevice(DEVICE_ID_1)), accountRecoveryPassword);
+    assertThrows(ReceiptAlreadyRedeemedException.class,
+        () -> accounts.create(secondAccount, receiptCredentialPresentation, accountRecoveryPassword,
+            Collections.emptyList()));
+  }
+
   @ParameterizedTest
   @ValueSource(strings = {"+14151112222"})
   @NullSource
@@ -567,7 +591,7 @@ class AccountsTest {
         generateAccount(number, existingUuid, number == null ? null : UUID.randomUUID(),
             List.of(generateDevice(DEVICE_ID_1)), accountRecoveryPassword);
 
-    existingAccount.setTotpKeys(Map.of((byte) 1, new AnnotatedTotpKey(new TotpKey(
+    existingAccount.setMfaKeys(Map.of((byte) 1, new AnnotatedTotpKey(new TotpKey(
         new TotpParameters(
             TimeBasedOneTimePasswordGenerator.TOTP_ALGORITHM_HMAC_SHA1,
             HmacOneTimePasswordGenerator.DEFAULT_PASSWORD_LENGTH,
@@ -589,12 +613,20 @@ class AccountsTest {
     if (number != null) {
       reclaimAccount(secondAccount);
     } else {
-      reclaimNumberlessAccount(secondAccount, receiptCredentialPresentation, accountRecoveryPassword);
+      // There are essentially two modes of 'reclamation' for a numberless account:
+      // - Try to create an account and then reclaim it on conflict to allow for idempotent retries of creation
+      // - Explicitly recover the account, since we know from the API if the client is trying to recover
+      // Only the second case works here, because we forbid idempotent retries if the account has already set an
+      // MFA key.
+      secondAccount.setAccountIdentifier(existingAccount.getAccountIdentifier());
+      accounts.reclaimAccount(existingAccount,
+          secondAccount,
+          Collections.emptyList()).toCompletableFuture().join();
     }
 
     final Account reclaimed = accounts.getByAccountIdentifier(existingUuid).orElseThrow();
 
-    assertThat(reclaimed.getTotpKeys()).isEqualTo(existingAccount.getTotpKeys());
+    assertThat(reclaimed.getMfaKeys()).isEqualTo(existingAccount.getMfaKeys());
   }
 
   @ParameterizedTest

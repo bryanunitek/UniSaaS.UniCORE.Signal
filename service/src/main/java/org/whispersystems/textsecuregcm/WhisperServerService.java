@@ -333,7 +333,6 @@ import org.whispersystems.textsecuregcm.workers.DeleteUserCommand;
 import org.whispersystems.textsecuregcm.workers.IdleDeviceNotificationSchedulerFactory;
 import org.whispersystems.textsecuregcm.workers.MessagePersisterServiceCommand;
 import org.whispersystems.textsecuregcm.workers.NotifyIdleDevicesCommand;
-import org.whispersystems.textsecuregcm.workers.PopulateAccountRecoveryPasswordsCommand;
 import org.whispersystems.textsecuregcm.workers.ProcessScheduledJobsServiceCommand;
 import org.whispersystems.textsecuregcm.workers.RegenerateSecondaryDynamoDbTableDataCommand;
 import org.whispersystems.textsecuregcm.workers.RemoveExpiredAccountsCommand;
@@ -413,8 +412,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new IdleDeviceNotificationSchedulerFactory()));
 
     bootstrap.addCommand(new RegenerateSecondaryDynamoDbTableDataCommand());
-
-    bootstrap.addCommand(new PopulateAccountRecoveryPasswordsCommand());
 
     ServiceLoader.load(SpamFilter.class)
         .stream()
@@ -668,10 +665,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         .workQueue(receiptSenderQueue)
         .rejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy())
         .build();
-    ExecutorService accountLockExecutor = ExecutorServiceBuilder.of(environment, "accountLock")
-        .minThreads(8)
-        .maxThreads(8)
-        .build();
     // unbounded executor (same as cachedThreadPool)
     ExecutorService remoteStorageHttpExecutor = ExecutorServiceBuilder.of(environment, "remoteStorage")
         .minThreads(0)
@@ -801,10 +794,10 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         changeNumberWaitingPeriods, config.getChangeNumber().postRegistrationWaitingPeriod(), clock);
     AccountLockManager accountLockManager = new AccountLockManager(dynamoDbClient,
         config.getDynamoDbTables().getDeletedAccountsLock().getTableName());
-    AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
+    final AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
         pubsubClient, accountLockManager, keysManager, messagesManager, profilesManager,
         changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
-        phoneNumberRecoveryPasswordsManager, accountLockExecutor, messagePollExecutor,
+        phoneNumberRecoveryPasswordsManager, messagePollExecutor,
         retryExecutor, clock, config.getLinkDeviceSecretConfiguration().secret().value(),
         config.getRegistrationTotpConfiguration().maxValidationDelay());
     RemoteConfigsManager remoteConfigsManager = new RemoteConfigsManager(remoteConfigs, config.getRemoteConfigConfiguration().globalConfig());
