@@ -35,6 +35,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -48,12 +49,13 @@ import org.signal.libsignal.protocol.ServiceId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
-import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
+import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.Pair;
 import org.whispersystems.textsecuregcm.util.ResilienceUtil;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import reactor.core.observability.micrometer.Micrometer;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -121,7 +123,6 @@ public class MessagesCache {
   private final ExecutorService messageDeletionExecutorService;
   // messageDeletionExecutorService wrapped into a reactor Scheduler
   private final Scheduler messageDeletionScheduler;
-  private final ExperimentEnrollmentManager experimentEnrollmentManager;
 
   private final MessagesCacheInsertScript insertScript;
   private final MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript insertMrmScript;
@@ -175,16 +176,13 @@ public class MessagesCache {
       final Scheduler messageDeliveryScheduler,
       final ExecutorService messageDeletionExecutorService,
       final ScheduledExecutorService retryExecutor,
-      final Clock clock,
-      final ExperimentEnrollmentManager experimentEnrollmentManager)
-      throws IOException {
+      final Clock clock) throws IOException {
 
     this(
         redisCluster,
         messageDeliveryScheduler,
         messageDeletionExecutorService,
         clock,
-        experimentEnrollmentManager,
         new MessagesCacheInsertScript(redisCluster, retryExecutor),
         new MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript(redisCluster, retryExecutor),
         new MessagesCacheGetItemsScript(redisCluster),
@@ -200,7 +198,6 @@ public class MessagesCache {
   MessagesCache(final FaultTolerantRedisClusterClient redisCluster,
                 final Scheduler messageDeliveryScheduler,
                 final ExecutorService messageDeletionExecutorService, final Clock clock,
-                final ExperimentEnrollmentManager experimentEnrollmentManager,
                 final MessagesCacheInsertScript insertScript,
                 final MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript insertMrmScript,
                 final MessagesCacheGetItemsScript getItemsScript,
@@ -216,7 +213,6 @@ public class MessagesCache {
     this.messageDeliveryScheduler = messageDeliveryScheduler;
     this.messageDeletionExecutorService = messageDeletionExecutorService;
     this.messageDeletionScheduler = Schedulers.fromExecutorService(messageDeletionExecutorService, "messageDeletion");
-    this.experimentEnrollmentManager = experimentEnrollmentManager;
 
     this.insertScript = insertScript;
     this.insertMrmScript = insertMrmScript;
@@ -233,7 +229,7 @@ public class MessagesCache {
       final byte destinationDeviceId,
       final MessageProtos.Envelope message) {
 
-    final MessageProtos.Envelope messageWithGuid = message.toBuilder().setServerGuid(messageGuid.toString()).build();
+    final MessageProtos.Envelope messageWithGuid = message.toBuilder().setServerGuid(UUIDUtil.toByteString(messageGuid)).build();
     final Timer.Sample sample = Timer.start();
 
     return insertScript.executeAsync(destinationAccountIdentifier, destinationDeviceId, messageWithGuid)
@@ -242,13 +238,14 @@ public class MessagesCache {
   }
 
   public CompletableFuture<byte[]> insertSharedMultiRecipientMessagePayload(
-      final SealedSenderMultiRecipientMessage sealedSenderMultiRecipientMessage) {
+      final SealedSenderMultiRecipientMessage sealedSenderMultiRecipientMessage,
+      final Set<SealedSenderMultiRecipientMessage.Recipient> resolvedRecipients) {
 
     final Timer.Sample sample = Timer.start();
 
     final byte[] sharedMrmKey = getSharedMrmKey(UUID.randomUUID());
 
-    return insertMrmScript.executeAsync(sharedMrmKey, sealedSenderMultiRecipientMessage)
+    return insertMrmScript.executeAsync(sharedMrmKey, sealedSenderMultiRecipientMessage, resolvedRecipients)
         .thenApply(_ -> sharedMrmKey)
         .toCompletableFuture()
         .whenComplete((_, _) -> sample.stop(insertSharedMrmPayloadTimer));
@@ -278,7 +275,7 @@ public class MessagesCache {
               removedMessages.add(RemovedMessage.fromEnvelope(envelope));
               if (envelope.hasSharedMrmKey()) {
                 serviceIdentifierToMrmKeys.computeIfAbsent(
-                        ServiceIdentifier.valueOf(envelope.getDestinationServiceId()), _ -> new ArrayList<>())
+                        ServiceIdentifier.fromByteString(envelope.getDestinationServiceId()), _ -> new ArrayList<>())
                     .add(envelope.getSharedMrmKey().toByteArray());
               }
             } catch (final InvalidProtocolBufferException e) {
@@ -398,13 +395,17 @@ public class MessagesCache {
   private void discardStaleMessages(final UUID destinationUuid, final byte destinationDevice,
       Flux<MessageProtos.Envelope> staleMessages, final Counter counter, final String context) {
     staleMessages
-        .map(e -> UUID.fromString(e.getServerGuid()))
+        .map(e -> UUIDUtil.fromByteString(e.getServerGuid()))
         .buffer(PAGE_SIZE)
         .subscribeOn(messageDeletionScheduler)
         .subscribe(messageGuids ->
                 remove(destinationUuid, destinationDevice, messageGuids)
                     .thenAccept(removedMessages -> counter.increment(removedMessages.size())),
-            e -> logger.warn("Could not remove stale {} messages from cache", context, e));
+            e -> {
+              if (!ExceptionUtils.isBreakerOpen(e)) {
+                logger.warn("Could not remove stale {} messages from cache", context, e);
+              }
+            });
   }
 
   @VisibleForTesting
@@ -479,7 +480,7 @@ public class MessagesCache {
     final byte[] key = mrmMessage.getSharedMrmKey().toByteArray();
     final byte[] sharedMrmViewKey = MessagesCache.getSharedMrmViewKey(
         // the message might be addressed to the account's PNI, so use the service ID from the envelope
-        ServiceIdentifier.valueOf(mrmMessage.getDestinationServiceId()), destinationDevice);
+        ServiceIdentifier.fromByteString(mrmMessage.getDestinationServiceId()), destinationDevice);
 
     return Mono.from(redisCluster.withBinaryCluster(
             conn -> conn.reactive().hmget(key, "data".getBytes(StandardCharsets.UTF_8), sharedMrmViewKey)
@@ -528,7 +529,9 @@ public class MessagesCache {
             // MRM data) fails after it has been delivered. We return it so that it may be discarded from the queue.
             result = Mono.just(mrmMessage.toBuilder().setSharedMrmKey(STALE_MRM_KEY).build());
           } else {
-            logger.warn("Failed to retrieve shared mrm data", throwable);
+            if (!ExceptionUtils.isBreakerOpen(throwable)) {
+              logger.warn("Failed to retrieve shared mrm data", throwable);
+            }
             // For unexpected errors, return empty. The message will remain in the queue and be retried in the future.
             result = Mono.empty();
           }
@@ -559,7 +562,9 @@ public class MessagesCache {
             REMOVE_MRM_RECIPIENT_VIEW_CONCURRENCY)
         .doOnNext(sharedMrmDataKeyRemovedCounter::increment)
         .onErrorResume(e -> {
-          logger.warn("Error removing recipient view", e);
+          if (!ExceptionUtils.isBreakerOpen(e)) {
+            logger.warn("Error removing recipient view", e);
+          }
           return Mono.just(0L);
         })
         .then()
@@ -670,10 +675,10 @@ public class MessagesCache {
             try {
               final MessageProtos.Envelope message = parseEnvelope(serialized);
 
-              processedMessages.add(message.getServerGuid());
+              processedMessages.add(UUIDUtil.fromByteString(message.getServerGuid()).toString());
 
               if (message.hasSharedMrmKey()) {
-                serviceIdentifierToMrmKeys.computeIfAbsent(ServiceIdentifier.valueOf(message.getDestinationServiceId()),
+                serviceIdentifierToMrmKeys.computeIfAbsent(ServiceIdentifier.fromByteString(message.getDestinationServiceId()),
                         _ -> new ArrayList<>())
                     .add(message.getSharedMrmKey().toByteArray());
               }
@@ -782,6 +787,6 @@ public class MessagesCache {
   private MessageProtos.Envelope parseEnvelope(final byte[] envelopeBytes)
       throws InvalidProtocolBufferException {
 
-    return EnvelopeUtil.expand(MessageProtos.Envelope.parseFrom(envelopeBytes), experimentEnrollmentManager);
+    return MessageProtos.Envelope.parseFrom(envelopeBytes);
   }
 }

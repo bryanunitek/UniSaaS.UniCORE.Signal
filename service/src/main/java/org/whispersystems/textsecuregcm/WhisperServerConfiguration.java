@@ -17,8 +17,10 @@ import org.whispersystems.textsecuregcm.configuration.AppleAppStoreConfiguration
 import org.whispersystems.textsecuregcm.configuration.AppleDeviceCheckConfiguration;
 import org.whispersystems.textsecuregcm.configuration.AttachmentsConfiguration;
 import org.whispersystems.textsecuregcm.configuration.AwsCredentialsProviderFactory;
+import org.whispersystems.textsecuregcm.configuration.BackupConfiguration;
 import org.whispersystems.textsecuregcm.configuration.BadgesConfiguration;
 import org.whispersystems.textsecuregcm.configuration.BraintreeConfiguration;
+import org.whispersystems.textsecuregcm.configuration.BulkheadConfiguration;
 import org.whispersystems.textsecuregcm.configuration.CallQualitySurveyConfiguration;
 import org.whispersystems.textsecuregcm.configuration.Cdn3StorageManagerConfiguration;
 import org.whispersystems.textsecuregcm.configuration.CdnConfiguration;
@@ -34,6 +36,7 @@ import org.whispersystems.textsecuregcm.configuration.ExternalRequestFilterConfi
 import org.whispersystems.textsecuregcm.configuration.FaultTolerantRedisClientFactory;
 import org.whispersystems.textsecuregcm.configuration.FaultTolerantRedisClusterFactory;
 import org.whispersystems.textsecuregcm.configuration.FcmConfiguration;
+import org.whispersystems.textsecuregcm.configuration.FoundationDbMessagesConfiguration;
 import org.whispersystems.textsecuregcm.configuration.GcpAttachmentsConfiguration;
 import org.whispersystems.textsecuregcm.configuration.GenericZkConfig;
 import org.whispersystems.textsecuregcm.configuration.GooglePlayBillingConfiguration;
@@ -42,6 +45,7 @@ import org.whispersystems.textsecuregcm.configuration.HlrLookupConfiguration;
 import org.whispersystems.textsecuregcm.configuration.IdlePrimaryDeviceReminderConfiguration;
 import org.whispersystems.textsecuregcm.configuration.KeyTransparencyServiceConfiguration;
 import org.whispersystems.textsecuregcm.configuration.LinkDeviceSecretConfiguration;
+import org.whispersystems.textsecuregcm.configuration.LoginPurchaseConfiguration;
 import org.whispersystems.textsecuregcm.configuration.MessageByteLimitCardinalityEstimatorConfiguration;
 import org.whispersystems.textsecuregcm.configuration.MessageCacheConfiguration;
 import org.whispersystems.textsecuregcm.configuration.OneTimeDonationConfiguration;
@@ -60,13 +64,15 @@ import org.whispersystems.textsecuregcm.configuration.SpamFilterConfiguration;
 import org.whispersystems.textsecuregcm.configuration.StripeConfiguration;
 import org.whispersystems.textsecuregcm.configuration.SubscriptionConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TlsKeyStoreConfiguration;
+import org.whispersystems.textsecuregcm.configuration.TotpConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TurnConfiguration;
 import org.whispersystems.textsecuregcm.configuration.UnidentifiedDeliveryConfiguration;
 import org.whispersystems.textsecuregcm.configuration.VirtualThreadConfiguration;
+import org.whispersystems.textsecuregcm.configuration.WebAuthnConfiguration;
 import org.whispersystems.textsecuregcm.configuration.ZkConfig;
 import org.whispersystems.websocket.configuration.WebSocketConfiguration;
 
-/** @noinspection MismatchedQueryAndUpdateOfCollection, WeakerAccess */
+// @noinspection MismatchedQueryAndUpdateOfCollection, WeakerAccess
 public class WhisperServerConfiguration extends Configuration {
 
   @NotNull
@@ -128,6 +134,11 @@ public class WhisperServerConfiguration extends Configuration {
   @Valid
   @JsonProperty
   private GcpAttachmentsConfiguration gcpAttachments;
+
+  @NotNull
+  @Valid
+  @JsonProperty
+  private BackupConfiguration backup = new BackupConfiguration();
 
   @NotNull
   @Valid
@@ -222,7 +233,7 @@ public class WhisperServerConfiguration extends Configuration {
   @Valid
   @NotNull
   @JsonProperty
-  private ZkConfig zkConfig;
+  private GenericZkConfig callingZkConfigPreV101;
 
   @Valid
   @NotNull
@@ -232,7 +243,12 @@ public class WhisperServerConfiguration extends Configuration {
   @Valid
   @NotNull
   @JsonProperty
-  private GenericZkConfig backupsZkConfig;
+  private GenericZkConfig chatZkConfig;
+
+  @Valid
+  @NotNull
+  @JsonProperty
+  private ZkConfig groupsZkConfig;
 
   @Valid
   @NotNull
@@ -258,6 +274,11 @@ public class WhisperServerConfiguration extends Configuration {
   @JsonProperty
   @NotNull
   private OneTimeDonationConfiguration oneTimeDonations;
+
+  @Valid
+  @JsonProperty
+  @NotNull
+  private LoginPurchaseConfiguration loginPurchase;
 
   @Valid
   @JsonProperty
@@ -319,9 +340,6 @@ public class WhisperServerConfiguration extends Configuration {
   private KeyTransparencyServiceConfiguration keyTransparencyService;
 
   @JsonProperty
-  private boolean logMessageDeliveryLoops;
-
-  @JsonProperty
   private IdlePrimaryDeviceReminderConfiguration idlePrimaryDeviceReminder =
       new IdlePrimaryDeviceReminderConfiguration(Duration.ofDays(30));
 
@@ -330,6 +348,9 @@ public class WhisperServerConfiguration extends Configuration {
 
   @JsonProperty
   private Map<String, @Valid RetryConfiguration> retries = Collections.emptyMap();
+
+  @JsonProperty
+  private Map<String, @Valid BulkheadConfiguration> bulkheads = Collections.emptyMap();
 
   @Valid
   @NotNull
@@ -360,6 +381,21 @@ public class WhisperServerConfiguration extends Configuration {
   @NotNull
   @JsonProperty
   private ChangeNumberConfiguration changeNumber = new ChangeNumberConfiguration(Duration.ofHours(1));
+
+  @Valid
+  @NotNull
+  @JsonProperty
+  private FoundationDbMessagesConfiguration foundationDbMessages;
+
+  @Valid
+  @NotNull
+  @JsonProperty
+  private TotpConfiguration registrationTotp = TotpConfiguration.DEFAULT;
+
+  @Valid
+  @NotNull
+  @JsonProperty
+  private WebAuthnConfiguration registrationWebAuthn;
 
   public TlsKeyStoreConfiguration getTlsKeyStoreConfiguration() {
     return tlsKeyStore;
@@ -415,6 +451,10 @@ public class WhisperServerConfiguration extends Configuration {
 
   public GcpAttachmentsConfiguration getGcpAttachmentsConfiguration() {
     return gcpAttachments;
+  }
+
+  public BackupConfiguration getBackupConfiguration() {
+    return backup;
   }
 
   public FaultTolerantRedisClusterFactory getCacheClusterConfiguration() {
@@ -481,16 +521,24 @@ public class WhisperServerConfiguration extends Configuration {
     return paymentsService;
   }
 
-  public ZkConfig getZkConfig() {
-    return zkConfig;
+  /// ZK secret limited to Chat Service
+  public GenericZkConfig getChatZkConfig() {
+    return chatZkConfig;
   }
 
+  /// ZK secret shared with Calling Service
+  public GenericZkConfig getCallingZkConfigPreV101() {
+    return callingZkConfigPreV101;
+  }
+
+  /// ZK secret shared with Calling Service
   public GenericZkConfig getCallingZkConfig() {
     return callingZkConfig;
   }
 
-  public GenericZkConfig getBackupsZkConfig() {
-    return backupsZkConfig;
+  /// ZK secret shared with Groups Service
+  public ZkConfig getGroupsZkConfig() {
+    return groupsZkConfig;
   }
 
   public RemoteConfigConfiguration getRemoteConfigConfiguration() {
@@ -511,6 +559,10 @@ public class WhisperServerConfiguration extends Configuration {
 
   public OneTimeDonationConfiguration getOneTimeDonations() {
     return oneTimeDonations;
+  }
+
+  public LoginPurchaseConfiguration getLoginPurchase() {
+    return loginPurchase;
   }
 
   public PagedSingleUseKEMPreKeyStoreConfiguration getPagedSingleUseKEMPreKeyStore() {
@@ -561,10 +613,6 @@ public class WhisperServerConfiguration extends Configuration {
     return keyTransparencyService;
   }
 
-  public boolean logMessageDeliveryLoops() {
-    return logMessageDeliveryLoops;
-  }
-
   public IdlePrimaryDeviceReminderConfiguration idlePrimaryDeviceReminderConfiguration() {
     return idlePrimaryDeviceReminder;
   }
@@ -575,6 +623,10 @@ public class WhisperServerConfiguration extends Configuration {
 
   public Map<String, RetryConfiguration> getRetryConfigurations() {
     return retries;
+  }
+
+  public Map<String, BulkheadConfiguration> getBulkheadConfigurations() {
+    return bulkheads;
   }
 
   public RetryConfiguration getGeneralRedisRetryConfiguration() {
@@ -599,5 +651,17 @@ public class WhisperServerConfiguration extends Configuration {
 
   public ChangeNumberConfiguration getChangeNumber() {
     return changeNumber;
+  }
+
+  public FoundationDbMessagesConfiguration getFoundationDbMessagesConfiguration() {
+    return foundationDbMessages;
+  }
+
+  public TotpConfiguration getRegistrationTotpConfiguration() {
+    return registrationTotp;
+  }
+
+  public WebAuthnConfiguration getRegistrationWebAuthnConfiguration() {
+    return registrationWebAuthn;
   }
 }

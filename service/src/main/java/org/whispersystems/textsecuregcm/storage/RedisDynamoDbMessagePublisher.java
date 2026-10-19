@@ -9,6 +9,7 @@ import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import io.micrometer.core.instrument.Metrics;
 import java.util.UUID;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow;
 import javax.annotation.Nullable;
 import org.reactivestreams.Publisher;
@@ -20,9 +21,9 @@ import reactor.core.observability.micrometer.Micrometer;
 import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Flux;
 
-/// A Redis/DynamoDB message publisher produces a non-terminating stream of messages for a specific device. It listens
-/// for message availability signals from [RedisMessageAvailabilityManager] and emits new messages to its subscriber
-/// when available.
+/// A Redis/DynamoDB message publisher produces an optionally-terminating stream of messages for a specific device. It
+/// listens for message availability signals from [RedisMessageAvailabilityManager] and emits new messages to its
+/// subscriber when available.
 ///
 /// This publisher supports only a single subscriber. It assumes that subscribers acknowledge (delete) messages as they
 /// read the messages, and may emit duplicate messages if subscribers do not acknowledge messages before requesting more
@@ -35,6 +36,8 @@ class RedisDynamoDbMessagePublisher implements MessageAvailabilityListener, Flow
 
   private final UUID accountIdentifier;
   private final Device device;
+
+  private final boolean terminateOnQueueEmpty;
 
   // Indicates which data source(s) we think might contain messages for the destination device. Messages initially land
   // in Redis, but are eventually "persisted" to DynamoDB. This state changes in response to signals this publisher
@@ -133,13 +136,15 @@ class RedisDynamoDbMessagePublisher implements MessageAvailabilityListener, Flow
       final MessagesCache messagesCache,
       final RedisMessageAvailabilityManager redisMessageAvailabilityManager,
       final UUID accountIdentifier,
-      final Device device) {
+      final Device device,
+      final boolean terminateOnQueueEmpty) {
 
     this.messagesDynamoDb = messagesDynamoDb;
     this.messagesCache = messagesCache;
     this.redisMessageAvailabilityManager = redisMessageAvailabilityManager;
     this.accountIdentifier = accountIdentifier;
     this.device = device;
+    this.terminateOnQueueEmpty = terminateOnQueueEmpty;
   }
 
   @Override
@@ -151,9 +156,16 @@ class RedisDynamoDbMessagePublisher implements MessageAvailabilityListener, Flow
 
     this.subscriber = subscriber;
 
-    // Listen for signals indicating that new messages are available in Redis, that messages have been persisted from
-    // Redis to DynamoDB, or that there's a conflicting message reader connected somewhere else
-    redisMessageAvailabilityManager.handleClientConnected(accountIdentifier, device.getId(), this);
+    @Nullable final CompletionStage<Void> clientConnectedFuture;
+
+    if (!terminateOnQueueEmpty) {
+      // If we're trying to follow a live stream of messages, then listen for signals indicating that new messages are
+      // available in Redis, that messages have been persisted from Redis to DynamoDB, or that there's a conflicting
+      // message reader connected somewhere else
+      clientConnectedFuture = redisMessageAvailabilityManager.handleClientConnected(accountIdentifier, device.getId(), this);
+    } else {
+      clientConnectedFuture = null;
+    }
 
     subscriber.onSubscribe(new Flow.Subscription() {
       @Override
@@ -166,6 +178,16 @@ class RedisDynamoDbMessagePublisher implements MessageAvailabilityListener, Flow
         terminate();
       }
     });
+
+    // Defer the client connected handling until after onSubscribe() is called. Otherwise, onError() might be called
+    // first, which violates the Reactive Streams spec.
+    if (clientConnectedFuture != null) {
+      clientConnectedFuture.whenComplete((_, throwable) -> {
+        if (throwable != null) {
+          handleMessageSourceError(throwable);
+        }
+      });
+    }
   }
 
   @Override
@@ -205,14 +227,24 @@ class RedisDynamoDbMessagePublisher implements MessageAvailabilityListener, Flow
 
   synchronized void handleMessageAcknowledged() {
     acknowledgedEntries += 1;
-    assert acknowledgedEntries <= publishedEntries;
 
-    maybeGenerateMessageSource();
+    if (!terminated) {
+      // As a temporary migration measure, we may receive additional acknowledgements after the stream has terminated
+      // (i.e. we're mirroring deletions from FoundationDB)
+      assert acknowledgedEntries <= publishedEntries;
+
+      maybeGenerateMessageSource();
+    }
   }
 
   private synchronized boolean maybeSendQueueEmptySignal() {
     // Regardless of any other state, don't do anything if terminated
     if (terminated) {
+      return false;
+    }
+
+    // Don't send a "queue empty" signal if we're supposed to terminate when the queue is empty
+    if (terminateOnQueueEmpty) {
       return false;
     }
 
@@ -249,6 +281,24 @@ class RedisDynamoDbMessagePublisher implements MessageAvailabilityListener, Flow
       return;
     }
 
+    if (acknowledgedEntries < publishedEntries) {
+      // To avoid double-reading messages from data stores that don't support cursors, don't get a new message source
+      // unless all previously-published signals have been acknowledged (when messages are acknowledged, we'll come back
+      // to this point with a higher value for `acknowledgedEntries` via `handleMessageAcknowledged`)
+      return;
+    }
+
+    if (terminateOnQueueEmpty && queueEmptySignalState == QueueEmptySignalState.PENDING) {
+      // If we've acknowledged everything we've published and we're ready to send a "queue empty" signal, we can use the
+      // "ready to send a 'queue empty' signal" state as our cue to terminate the subscription
+      assert subscriber != null;
+
+      subscriber.onComplete();
+      terminate();
+
+      return;
+    }
+
     if (storedMessageState == StoredMessageState.EMPTY) {
       // We don't think there are any messages in either message source; don't do anything until the situation changes
       // (when new messages arrive, we'll come back to this point with a non-empty stored message state)
@@ -258,13 +308,6 @@ class RedisDynamoDbMessagePublisher implements MessageAvailabilityListener, Flow
     if (publishedEntries == requestedDemand) {
       // Even if there are messages available, there's no demand for them yet (when there's new demand, we'll come back
       // to this point with a higher value for `requestedDemand` via `addDemand`)
-      return;
-    }
-
-    if (acknowledgedEntries < publishedEntries) {
-      // To avoid double-reading messages from data stores that don't support cursors, don't get a new message source
-      // unless all previously-published signals have been acknowledged (when messages are acknowledged, we'll come back
-      // to this point with a higher value for `acknowledgedEntries` via `handleMessageAcknowledged`)
       return;
     }
 
@@ -368,7 +411,7 @@ class RedisDynamoDbMessagePublisher implements MessageAvailabilityListener, Flow
       }
 
       // Stop receiving signals about new messages/conflicting consumers
-      redisMessageAvailabilityManager.handleClientDisconnected(accountIdentifier, device.getId());
+      redisMessageAvailabilityManager.handleClientDisconnected(accountIdentifier, device.getId(), this);
     }
   }
 }

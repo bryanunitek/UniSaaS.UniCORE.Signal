@@ -32,6 +32,7 @@ import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfigurati
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.metrics.DevicePlatformUtil;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import org.whispersystems.textsecuregcm.util.Util;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -248,7 +249,7 @@ public class MessagePersister implements Managed {
                     .filter(e -> !(e instanceof MessagePersistenceException)))
                 .onErrorResume(e -> {
                   logger.warn("Failed to persist queue {}::{} ({}); will schedule for retry",
-                      account.getIdentifier(IdentityType.ACI), device.getId(), node.getUri().getHost(), e);
+                      account.getAccountIdentifier(), device.getId(), node.getUri().getHost(), e);
 
                   return Mono.empty();
                 });
@@ -269,7 +270,7 @@ public class MessagePersister implements Managed {
 
   @VisibleForTesting
   Mono<Void> persistQueue(final Account account, final Device device, final Tags baseTags) {
-    final UUID accountUuid = account.getUuid();
+    final UUID accountUuid = account.getAccountIdentifier();
     final byte deviceId = device.getId();
 
     final Tag platformTag = Tag.of("platform", DevicePlatformUtil.getDevicePlatform(device)
@@ -304,7 +305,7 @@ public class MessagePersister implements Managed {
               // may throw, in which case we'll retry later by the usual mechanism
               if (isPrimary) {
                 logger.warn("Failed to persist queue {}::{} due to overfull queue; will trim oldest messages",
-                    account.getUuid(), deviceId);
+                    account.getAccountIdentifier(), deviceId);
 
                 return trimQueue(account, device)
                     .then(Mono.error(new MessagePersistenceException("Could not persist due to an overfull queue. Trimmed primary queue, a subsequent retry may succeed")));
@@ -330,7 +331,7 @@ public class MessagePersister implements Managed {
   }
 
   private Mono<Void> trimQueue(final Account account, final Device device) {
-    final UUID aci = account.getIdentifier(IdentityType.ACI);
+    final UUID aci = account.getAccountIdentifier();
     final byte deviceId = device.getId();
 
     final double extraRoomRatio = this.dynamicConfigurationManager.getConfiguration()
@@ -349,7 +350,7 @@ public class MessagePersister implements Managed {
           cachedMessageBytes.set(estimatedPersistedQueueSize);
           targetDeleteBytes.set(Math.round(estimatedPersistedQueueSize * extraRoomRatio));
 
-          return Flux.from(messagesManager.getMessagesForDeviceReactive(aci, device, false))
+          return Flux.from(messagesManager.getMessagesForDevice(aci, device))
               .concatMap(envelope -> {
                 if (bytesDeleted.getAndAdd(envelope.getSerializedSize()) >= targetDeleteBytes.get()) {
                   return Mono.just(Optional.<MessageProtos.Envelope>empty());
@@ -366,7 +367,7 @@ public class MessagePersister implements Managed {
                 TRIMMED_MESSAGE_BYTES_COUNTER.increment(envelope.getSerializedSize());
                 return Mono
                     .fromCompletionStage(() -> messagesManager
-                        .delete(aci, device, UUID.fromString(envelope.getServerGuid()), envelope.getServerTimestamp()))
+                        .delete(aci, device, UUIDUtil.fromByteString(envelope.getServerGuid()), envelope.getServerTimestamp()))
                     .retryWhen(retryBackoffSpec)
                     .map(Optional::isPresent);
               })

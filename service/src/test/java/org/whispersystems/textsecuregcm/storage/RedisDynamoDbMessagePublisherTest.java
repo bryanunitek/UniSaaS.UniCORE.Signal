@@ -37,11 +37,11 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
-import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.push.RedisMessageAvailabilityManager;
 import org.whispersystems.textsecuregcm.redis.RedisClusterExtension;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import reactor.adapter.JdkFlowAdapter;
 import reactor.core.Disposable;
 import reactor.core.scheduler.Scheduler;
@@ -82,11 +82,10 @@ class RedisDynamoDbMessagePublisherTest {
         DYNAMO_DB_EXTENSION.getDynamoDbAsyncClient(),
         DynamoDbExtensionSchema.Tables.MESSAGES.tableName(),
         Duration.ofDays(14),
-        sharedExecutorService,
-        mock(ExperimentEnrollmentManager.class));
+        sharedExecutorService);
 
     messagesCache = new MessagesCache(REDIS_CLUSTER_EXTENSION.getRedisCluster(),
-        messageDeliveryScheduler, sharedExecutorService, mock(ScheduledExecutorService.class), Clock.systemUTC(), mock(ExperimentEnrollmentManager.class));
+        messageDeliveryScheduler, sharedExecutorService, mock(ScheduledExecutorService.class), Clock.systemUTC());
 
     redisMessageAvailabilityManager = mock(RedisMessageAvailabilityManager.class);
 
@@ -113,35 +112,35 @@ class RedisDynamoDbMessagePublisherTest {
       final UUID accountIdentifier = UUID.randomUUID();
 
       final RedisDynamoDbMessagePublisher _ =
-          new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, accountIdentifier, device);
+          new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, accountIdentifier, device, false);
 
       verify(redisMessageAvailabilityManager, never()).handleClientConnected(eq(accountIdentifier), eq(deviceId), any());
-      verify(redisMessageAvailabilityManager, never()).handleClientDisconnected(eq(accountIdentifier), eq(deviceId));
+      verify(redisMessageAvailabilityManager, never()).handleClientDisconnected(eq(accountIdentifier), eq(deviceId), any());
     }
 
     {
       final UUID accountIdentifier = UUID.randomUUID();
 
       final RedisDynamoDbMessagePublisher messagePublisher =
-          new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, accountIdentifier, device);
+          new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, accountIdentifier, device, false);
 
       JdkFlowAdapter.flowPublisherToFlux(messagePublisher).subscribe();
 
       verify(redisMessageAvailabilityManager).handleClientConnected(eq(accountIdentifier), eq(deviceId), any());
-      verify(redisMessageAvailabilityManager, never()).handleClientDisconnected(eq(accountIdentifier), eq(deviceId));
+      verify(redisMessageAvailabilityManager, never()).handleClientDisconnected(eq(accountIdentifier), eq(deviceId), any());
     }
 
     {
       final UUID accountIdentifier = UUID.randomUUID();
 
       final RedisDynamoDbMessagePublisher messagePublisher =
-          new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, accountIdentifier, device);
+          new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, accountIdentifier, device, false);
 
       final Disposable disposable = JdkFlowAdapter.flowPublisherToFlux(messagePublisher).subscribe();
       disposable.dispose();
 
       verify(redisMessageAvailabilityManager).handleClientConnected(eq(accountIdentifier), eq(deviceId), any());
-      verify(redisMessageAvailabilityManager).handleClientDisconnected(eq(accountIdentifier), eq(deviceId));
+      verify(redisMessageAvailabilityManager).handleClientDisconnected(eq(accountIdentifier), eq(deviceId), any());
     }
   }
 
@@ -151,13 +150,46 @@ class RedisDynamoDbMessagePublisherTest {
     final MessageProtos.Envelope redisMessage = insertRedisMessage(generateRandomMessage());
 
     final RedisDynamoDbMessagePublisher messagePublisher =
-        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
     StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messagePublisher))
         .expectNext(new MessageStreamEntry.Envelope(dynamoDbMessage))
         .expectNext(new MessageStreamEntry.Envelope(redisMessage))
         .expectNext(new MessageStreamEntry.QueueEmpty())
-        .verifyTimeout(Duration.ofMillis(500));
+        .expectNoEvent(Duration.ofMillis(100))
+        .thenCancel()
+        .verify();
+  }
+
+  @Test
+  void publishMessagesTerminateOnEmpty() {
+    final MessageProtos.Envelope dynamoDbMessage = insertDynamoDbMessage(generateRandomMessage());
+    final MessageProtos.Envelope redisMessage = insertRedisMessage(generateRandomMessage());
+
+    final RedisDynamoDbMessagePublisher messagePublisher =
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, true);
+
+    StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messagePublisher))
+        .expectNext(new MessageStreamEntry.Envelope(dynamoDbMessage))
+        .expectNext(new MessageStreamEntry.Envelope(redisMessage))
+        .expectNoEvent(Duration.ofMillis(100))
+        .then(() -> {
+          // Acknowledge the DynamoDB message and the Redis message
+          messagePublisher.handleMessageAcknowledged();
+          messagePublisher.handleMessageAcknowledged();
+        })
+        .expectComplete()
+        .verify();
+  }
+
+  @Test
+  void publishMessagesTerminateNoMessages() {
+    final RedisDynamoDbMessagePublisher messagePublisher =
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, true);
+
+    StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messagePublisher))
+        .expectComplete()
+        .verify();
   }
 
   @Test
@@ -165,12 +197,14 @@ class RedisDynamoDbMessagePublisherTest {
     final MessageProtos.Envelope dynamoDbMessage = insertDynamoDbMessage(generateRandomMessage());
 
     final RedisDynamoDbMessagePublisher messagePublisher =
-        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
     StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messagePublisher))
         .expectNext(new MessageStreamEntry.Envelope(dynamoDbMessage))
         .expectNext(new MessageStreamEntry.QueueEmpty())
-        .verifyTimeout(Duration.ofMillis(500));
+        .expectNoEvent(Duration.ofMillis(100))
+        .thenCancel()
+        .verify();
   }
 
   @Test
@@ -178,12 +212,14 @@ class RedisDynamoDbMessagePublisherTest {
     final MessageProtos.Envelope redisMessage = insertRedisMessage(generateRandomMessage());
 
     final RedisDynamoDbMessagePublisher messagePublisher =
-        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
     StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messagePublisher))
         .expectNext(new MessageStreamEntry.Envelope(redisMessage))
         .expectNext(new MessageStreamEntry.QueueEmpty())
-        .verifyTimeout(Duration.ofMillis(500));
+        .expectNoEvent(Duration.ofMillis(100))
+        .thenCancel()
+        .verify();
   }
 
   @Test
@@ -194,7 +230,7 @@ class RedisDynamoDbMessagePublisherTest {
     final MessageProtos.Envelope newArrivalRedisMessage = generateRandomMessage();
 
     final RedisDynamoDbMessagePublisher messagePublisher =
-        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
     final CountDownLatch queueEmptyCountDownLatch = new CountDownLatch(1);
 
@@ -225,7 +261,9 @@ class RedisDynamoDbMessagePublisherTest {
         .expectNext(new MessageStreamEntry.Envelope(redisMessage))
         .expectNext(new MessageStreamEntry.QueueEmpty())
         .expectNext(new MessageStreamEntry.Envelope(newArrivalRedisMessage))
-        .verifyTimeout(Duration.ofMillis(500));
+        .expectNoEvent(Duration.ofMillis(100))
+        .thenCancel()
+        .verify();
   }
 
   @Test
@@ -236,7 +274,7 @@ class RedisDynamoDbMessagePublisherTest {
     final MessageProtos.Envelope persistedMessage = generateRandomMessage();
 
     final RedisDynamoDbMessagePublisher messagePublisher =
-        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
     final CountDownLatch queueEmptyCountDownLatch = new CountDownLatch(1);
 
@@ -267,7 +305,9 @@ class RedisDynamoDbMessagePublisherTest {
         .expectNext(new MessageStreamEntry.Envelope(redisMessage))
         .expectNext(new MessageStreamEntry.QueueEmpty())
         .expectNext(new MessageStreamEntry.Envelope(persistedMessage))
-        .verifyTimeout(Duration.ofMillis(500));
+        .expectNoEvent(Duration.ofMillis(100))
+        .thenCancel()
+        .verify();
   }
 
   @Test
@@ -278,11 +318,11 @@ class RedisDynamoDbMessagePublisherTest {
     final MessageProtos.Envelope persistedMessage = generateRandomMessage();
 
     final RedisDynamoDbMessagePublisher messagePublisher =
-        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
     final CountDownLatch queueEmptyCountDownLatch = new CountDownLatch(1);
 
-    Thread.ofVirtual().start(() -> {
+    final Thread persister = Thread.ofVirtual().start(() -> {
       try {
         queueEmptyCountDownLatch.await();
       } catch (final InterruptedException e) {
@@ -302,13 +342,23 @@ class RedisDynamoDbMessagePublisherTest {
         .expectNext(new MessageStreamEntry.Envelope(dynamoDbMessage))
         .expectNext(new MessageStreamEntry.Envelope(redisMessage))
         .expectNext(new MessageStreamEntry.QueueEmpty())
-        .verifyTimeout(Duration.ofMillis(500));
+        .then(() -> {
+          try {
+            persister.join();
+          } catch (final InterruptedException e) {
+            throw new RuntimeException(e);
+          }
+        })
+        // Extra time to catch unexpected events after persisting completes
+        .expectNoEvent(Duration.ofMillis(500))
+        .thenCancel()
+        .verify();
   }
 
   @Test
   void publishMessagesConsumerConflict() {
     final RedisDynamoDbMessagePublisher messagePublisher =
-        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
     final CountDownLatch countDownLatch = new CountDownLatch(1);
 
@@ -328,7 +378,27 @@ class RedisDynamoDbMessagePublisherTest {
         .verify();
 
     verify(redisMessageAvailabilityManager, timeout(1_000)).handleClientConnected(DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice.getId(), messagePublisher);
-    verify(redisMessageAvailabilityManager, timeout(1_000)).handleClientDisconnected(DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice.getId());
+    verify(redisMessageAvailabilityManager, timeout(1_000)).handleClientDisconnected(DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice.getId(), messagePublisher);
+  }
+
+  @Test
+  void publishMessagesClientConnectedFailure() {
+    final CompletableFuture<Void> clientConnectedFuture = new CompletableFuture<>();
+
+    final RuntimeException exception = new RuntimeException("OH NO");
+    clientConnectedFuture.completeExceptionally(exception);
+
+    final RedisDynamoDbMessagePublisher messagePublisher =
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
+
+    when(redisMessageAvailabilityManager.handleClientConnected(DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice.getId(), messagePublisher))
+        .thenReturn(clientConnectedFuture);
+
+    StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messagePublisher))
+        .expectErrorMatches(exception::equals)
+        .verify();
+
+    verify(redisMessageAvailabilityManager).handleClientDisconnected(DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice.getId(), messagePublisher);
   }
 
   @ParameterizedTest
@@ -349,7 +419,7 @@ class RedisDynamoDbMessagePublisherTest {
     }
 
     final RedisDynamoDbMessagePublisher messagePublisher =
-        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+        new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
     final List<MessageProtos.Envelope> publishedMessages = new ArrayList<>(expectedMessages.size());
 
@@ -378,27 +448,31 @@ class RedisDynamoDbMessagePublisherTest {
     {
       final RedisDynamoDbMessagePublisher messagePublisher =
           new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager,
-              DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+              DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
       StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messagePublisher), 1)
           .expectNext(new MessageStreamEntry.Envelope(redisMessage))
-          .verifyTimeout(Duration.ofMillis(500));
+          .expectNoEvent(Duration.ofMillis(100))
+          .thenCancel()
+          .verify();
     }
 
     {
       final RedisDynamoDbMessagePublisher messagePublisher =
           new RedisDynamoDbMessagePublisher(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager,
-              DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice);
+              DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice, false);
 
       StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messagePublisher), 2)
           .expectNext(new MessageStreamEntry.Envelope(redisMessage))
           .expectNext(new MessageStreamEntry.QueueEmpty())
-          .verifyTimeout(Duration.ofMillis(500));
+          .expectNoEvent(Duration.ofMillis(100))
+          .thenCancel()
+          .verify();
     }
   }
 
   private MessageProtos.Envelope insertRedisMessage(final MessageProtos.Envelope message) {
-    messagesCache.insert(UUID.fromString(message.getServerGuid()),
+    messagesCache.insert(UUIDUtil.fromByteString(message.getServerGuid()),
         DESTINATION_SERVICE_IDENTIFIER.uuid(),
         destinationDevice.getId(),
         message)
@@ -408,7 +482,7 @@ class RedisDynamoDbMessagePublisherTest {
   }
 
   private void deleteRedisMessage(final MessageProtos.Envelope message) {
-    messagesCache.remove(DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice.getId(), UUID.fromString(message.getServerGuid())).join();
+    messagesCache.remove(DESTINATION_SERVICE_IDENTIFIER.uuid(), destinationDevice.getId(), UUIDUtil.fromByteString(message.getServerGuid())).join();
   }
 
   private MessageProtos.Envelope insertDynamoDbMessage(final MessageProtos.Envelope message) {
@@ -420,7 +494,7 @@ class RedisDynamoDbMessagePublisherTest {
   private void deleteDynamoDbMessage(final MessageProtos.Envelope message) {
     messagesDynamoDb.deleteMessage(DESTINATION_SERVICE_IDENTIFIER.uuid(),
         destinationDevice,
-        UUID.fromString(message.getServerGuid()),
+        UUIDUtil.fromByteString(message.getServerGuid()),
         message.getServerTimestamp())
         .join();
   }
@@ -434,8 +508,8 @@ class RedisDynamoDbMessagePublisherTest {
         .setServerTimestamp(timestamp)
         .setContent(ByteString.copyFromUtf8(RandomStringUtils.secure().nextAlphanumeric(256)))
         .setType(MessageProtos.Envelope.Type.CIPHERTEXT)
-        .setServerGuid(UUID.randomUUID().toString())
-        .setDestinationServiceId(DESTINATION_SERVICE_IDENTIFIER.toServiceIdentifierString());
+        .setServerGuid(UUIDUtil.toByteString(UUID.randomUUID()))
+        .setDestinationServiceId(DESTINATION_SERVICE_IDENTIFIER.toCompactByteString());
 
     return envelopeBuilder.build();
   }
