@@ -7,7 +7,6 @@ package org.whispersystems.textsecuregcm.controllers;
 
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.i18n.phonenumbers.NumberParseException;
 import com.google.i18n.phonenumbers.PhoneNumberUtil;
 import com.google.i18n.phonenumbers.Phonenumber;
@@ -61,6 +60,7 @@ import java.util.Objects;
 import java.util.Optional;
 import org.apache.commons.lang3.Strings;
 import org.apache.http.HttpStatus;
+import org.glassfish.jersey.server.ManagedAsync;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.captcha.AssessmentResult;
@@ -73,9 +73,7 @@ import org.whispersystems.textsecuregcm.entities.SubmitVerificationCodeRequest;
 import org.whispersystems.textsecuregcm.entities.UpdateVerificationSessionRequest;
 import org.whispersystems.textsecuregcm.entities.VerificationCodeRequest;
 import org.whispersystems.textsecuregcm.entities.VerificationSessionResponse;
-import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.filters.RemoteAddressFilter;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.mappers.RegistrationServiceSenderExceptionMapper;
 import org.whispersystems.textsecuregcm.metrics.CaptchaMetrics;
@@ -132,9 +130,6 @@ public class VerificationController {
   private static final String EXISTING_ACCOUNT_PLATFORM = "existingAccountPlatform";
   private static final String EXISTING_ACCOUNT_RECENTLY_SEEN_TAG_NAME = "existingAccountRecentlySeen";
 
-  @VisibleForTesting
-  static final String VERIFICATION_CODE_PUSH_NOTIFICATION_EXPERIMENT_NAME = "verificationCodePushNotification";
-
   private final RegistrationServiceClient registrationServiceClient;
   private final VerificationSessionManager verificationSessionManager;
   private final PushNotificationManager pushNotificationManager;
@@ -146,7 +141,6 @@ public class VerificationController {
   private final CarrierDataProvider carrierDataProvider;
   private final RegistrationFraudChecker registrationFraudChecker;
   private final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager;
-  private final ExperimentEnrollmentManager experimentEnrollmentManager;
   private final Clock clock;
 
   public VerificationController(final RegistrationServiceClient registrationServiceClient,
@@ -160,7 +154,6 @@ public class VerificationController {
       final CarrierDataProvider carrierDataProvider,
       final RegistrationFraudChecker registrationFraudChecker,
       final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
-      final ExperimentEnrollmentManager experimentEnrollmentManager,
       final Clock clock) {
     this.registrationServiceClient = registrationServiceClient;
     this.verificationSessionManager = verificationSessionManager;
@@ -173,7 +166,6 @@ public class VerificationController {
     this.carrierDataProvider = carrierDataProvider;
     this.registrationFraudChecker = registrationFraudChecker;
     this.dynamicConfigurationManager = dynamicConfigurationManager;
-    this.experimentEnrollmentManager = experimentEnrollmentManager;
     this.clock = clock;
   }
 
@@ -193,6 +185,7 @@ public class VerificationController {
       name = "Retry-After",
       description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed",
       schema = @Schema(implementation = Integer.class)))
+  @ManagedAsync
   public VerificationSessionResponse createSession(@NotNull @Valid final CreateVerificationSessionRequest request,
       @Context final ContainerRequestContext requestContext)
       throws RateLimitExceededException, ObsoletePhoneNumberFormatException {
@@ -272,6 +265,7 @@ public class VerificationController {
           name = "Retry-After",
           description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed",
           schema = @Schema(implementation = Integer.class)))
+  @ManagedAsync
   public VerificationSessionResponse updateSession(
       @PathParam("sessionId") final String encodedSessionId,
       @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent,
@@ -527,6 +521,7 @@ public class VerificationController {
   @ApiResponse(responseCode = "400", description = "Invalid session ID")
   @ApiResponse(responseCode = "404", description = "Session with the specified ID could not be found")
   @ApiResponse(responseCode = "422", description = "Malformed session ID encoding")
+  @ManagedAsync
   public VerificationSessionResponse getSession(@PathParam("sessionId") final String encodedSessionId) {
 
     final RegistrationServiceSession registrationServiceSession = retrieveRegistrationServiceSession(encodedSessionId);
@@ -573,6 +568,7 @@ public class VerificationController {
       future attempts to request or submit verification codes (since those attempts would be all but guaranteed to fail).
       """,
       content = @Content(schema = @Schema(implementation = RegistrationServiceSenderExceptionMapper.SendVerificationCodeFailureResponse.class)))
+  @ManagedAsync
   public VerificationSessionResponse requestVerificationCode(@PathParam("sessionId") final String encodedSessionId,
       @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent,
       @Parameter(in = ParameterIn.HEADER, description = "Ordered list of languages in which the client prefers to receive SMS or voice verification messages") @HeaderParam(HttpHeaders.ACCEPT_LANGUAGE)
@@ -665,8 +661,6 @@ public class VerificationController {
     }
 
     accountsManager.getByE164(registrationServiceSession.number())
-        .filter(existingAccount ->
-            experimentEnrollmentManager.isEnrolled(existingAccount.getAccountIdentifier(), VERIFICATION_CODE_PUSH_NOTIFICATION_EXPERIMENT_NAME))
         .ifPresent(existingAccount -> {
           try {
             pushNotificationManager.sendVerificationCodeRequestedNotifications(existingAccount, clock.instant());
@@ -711,6 +705,7 @@ public class VerificationController {
           name = "Retry-After",
           description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed",
           schema = @Schema(implementation = Integer.class)))
+  @ManagedAsync
   public VerificationSessionResponse verifyCode(@PathParam("sessionId") final String encodedSessionId,
       @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent,
       @NotNull @Valid final SubmitVerificationCodeRequest submitVerificationCodeRequest) {

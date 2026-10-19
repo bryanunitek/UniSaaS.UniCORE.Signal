@@ -67,11 +67,12 @@ public class AccountsManagerDeviceTransferIntegrationTest {
         mock(SecureValueRecoveryClient.class),
         mock(DisconnectionRequestManager.class),
         mock(PhoneNumberRecoveryPasswordsManager.class),
+        mock(SandboxAccounts.class),
         mock(ScheduledExecutorService.class),
         mock(ScheduledExecutorService.class),
         Clock.systemUTC(),
         "link-device-secret".getBytes(StandardCharsets.UTF_8),
-        AccountsManager.TOTP.getTimeStep().dividedBy(2),
+        null,
         null);
 
     accountsManager.start();

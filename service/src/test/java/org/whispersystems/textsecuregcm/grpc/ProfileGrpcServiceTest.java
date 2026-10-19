@@ -6,6 +6,7 @@
 package org.whispersystems.textsecuregcm.grpc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -60,8 +61,8 @@ import org.mockito.Mock;
 import org.signal.chat.common.IdentityType;
 import org.signal.chat.common.ServiceIdentifier;
 import org.signal.chat.profile.AccountInfo;
-import org.signal.chat.profile.GetAvatarCredentialsRequest;
-import org.signal.chat.profile.GetAvatarCredentialsResponse;
+import org.signal.chat.profile.GetAvatarCredentialRequest;
+import org.signal.chat.profile.GetAvatarCredentialResponse;
 import org.signal.chat.profile.GetProfileRequest;
 import org.signal.chat.profile.GetProfileResponse;
 import org.signal.chat.profile.LegacyProfileResult;
@@ -107,7 +108,7 @@ import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.VersionedProfile;
 import org.whispersystems.textsecuregcm.storage.VersionedProfileV1;
 import org.whispersystems.textsecuregcm.storage.WriteConflictException;
-import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.tests.util.AuthHelper;
 import org.whispersystems.textsecuregcm.tests.util.ProfileTestHelper;
 import org.whispersystems.textsecuregcm.util.MockUtils;
@@ -339,7 +340,9 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     final byte[] validPaymentAddress = new byte[582];
     final byte[] validPhoneNumberSharing = new byte[29];
 
-    doThrow(WriteConflictException.class)
+    final byte[] conflictedVersion = TestRandomUtil.nextBytes(32);
+
+    doThrow(new WriteConflictException(conflictedVersion))
         .when(accountsManager).updateCurrentProfileVersion(any(), any(), any(), any());
 
     final SetProfileRequest request = SetProfileRequest.newBuilder()
@@ -358,24 +361,9 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     final SetProfileResponse response = authenticatedServiceStub().setProfile(request);
 
     assertTrue(response.hasExpectedVersionWriteConflict());
+    assertArrayEquals(conflictedVersion, response.getExpectedVersionWriteConflict().getCurrentProfileVersion().toByteArray());
     verify(profilesManager).set(any(), any(), any(), any());
     verify(accountsManager).updateCurrentProfileVersion(any(), any(), any(), any());
-  }
-
-  @Test
-  void setProfileWithoutCapability() {
-    when(account.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(false);
-
-    final SetProfileRequest request = SetProfileRequest.newBuilder()
-        .setVersion(ByteString.copyFrom(VERSION))
-        .setData(ByteString.copyFrom(VALID_DATA))
-        .setExpectedCurrentDataHash(ByteString.copyFrom(TestRandomUtil.nextBytes(32)))
-        .setV1Request(V1_REQUEST)
-        .build();
-
-    final SetProfileResponse response = authenticatedServiceStub().setProfile(request);
-
-    assertTrue(response.hasProfilesV2CapabilityRequired());
   }
 
   @Test
@@ -863,15 +851,15 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
         new ServiceId.Aci(AUTHENTICATED_ACI), zkCredentialKeyPair, rotationId);
     final AvatarUploadCredentialRequest credentialRequest = avatarUploadCredentialRequestContext.getRequest();
 
-    final GetAvatarCredentialsResponse response = authenticatedServiceStub().getAvatarCredentials(
-        GetAvatarCredentialsRequest.newBuilder()
-            .setAvatarCredentialsRequest(ByteString.copyFrom(credentialRequest.serialize()))
+    final GetAvatarCredentialResponse response = authenticatedServiceStub().getAvatarCredential(
+        GetAvatarCredentialRequest.newBuilder()
+            .setAvatarCredentialRequest(ByteString.copyFrom(credentialRequest.serialize()))
             .build());
 
-    assertTrue(response.hasAvatarCredentials());
+    assertTrue(response.hasAvatarCredential());
 
     assertDoesNotThrow(() -> avatarUploadCredentialRequestContext.receiveResponse(
-        new AvatarUploadCredentialResponse(response.getAvatarCredentials().toByteArray()),
+        new AvatarUploadCredentialResponse(response.getAvatarCredential().toByteArray()),
         genericServerSecretParams.getPublicParams()));
   }
 
@@ -880,7 +868,7 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI)).thenReturn(Optional.empty());
 
     final StatusRuntimeException statusRuntimeException = assertStatusException(Status.UNAUTHENTICATED,
-        () -> authenticatedServiceStub().getAvatarCredentials(GetAvatarCredentialsRequest.getDefaultInstance()));
+        () -> authenticatedServiceStub().getAvatarCredential(GetAvatarCredentialRequest.getDefaultInstance()));
     assertEquals("invalid credentials", statusRuntimeException.getStatus().getDescription());
   }
 
@@ -888,8 +876,8 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
   void getAvatarCredentialMissingZkCredentialKey() {
     when(account.getZkCredentialKey()).thenReturn(Optional.empty());
 
-    final GetAvatarCredentialsResponse response = authenticatedServiceStub().getAvatarCredentials(
-        GetAvatarCredentialsRequest.getDefaultInstance());
+    final GetAvatarCredentialResponse response = authenticatedServiceStub().getAvatarCredential(
+        GetAvatarCredentialRequest.getDefaultInstance());
 
     assertTrue(response.hasMissingZkCredentialKey());
 
@@ -913,9 +901,9 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     final AvatarUploadCredentialRequest credentialRequest = avatarUploadCredentialRequestContext.getRequest();
 
     final StatusRuntimeException statusRuntimeException = assertStatusInvalidArgument(
-        () -> authenticatedServiceStub().getAvatarCredentials(
-            GetAvatarCredentialsRequest.newBuilder()
-                .setAvatarCredentialsRequest(ByteString.copyFrom(credentialRequest.serialize()))
+        () -> authenticatedServiceStub().getAvatarCredential(
+            GetAvatarCredentialRequest.newBuilder()
+                .setAvatarCredentialRequest(ByteString.copyFrom(credentialRequest.serialize()))
                 .build()));
 
     assertEquals("invalid credential request", statusRuntimeException.getStatus().getDescription());

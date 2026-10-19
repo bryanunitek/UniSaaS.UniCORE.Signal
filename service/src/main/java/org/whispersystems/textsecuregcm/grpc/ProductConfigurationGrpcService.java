@@ -1,6 +1,5 @@
 package org.whispersystems.textsecuregcm.grpc;
 
-import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,9 +16,10 @@ import org.signal.chat.purchase.SimpleProductConfigurationGrpc;
 import org.whispersystems.textsecuregcm.configuration.LoginPurchaseConfiguration;
 import org.whispersystems.textsecuregcm.configuration.OneTimeDonationConfiguration;
 import org.whispersystems.textsecuregcm.configuration.SubscriptionConfiguration;
-import org.whispersystems.textsecuregcm.subscriptions.CustomerAwareSubscriptionPaymentProcessor;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentMethod;
-import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
+import org.whispersystems.textsecuregcm.purchases.CustomerAwareSubscriptionPaymentProcessor;
+import org.whispersystems.textsecuregcm.purchases.PaymentMethod;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
+import org.whispersystems.textsecuregcm.purchases.SubscriptionCurrencyUtil;
 
 public class ProductConfigurationGrpcService extends SimpleProductConfigurationGrpc.ProductConfigurationImplBase {
   private final GetConfigurationResponse configurationResponse;
@@ -32,7 +32,8 @@ public class ProductConfigurationGrpcService extends SimpleProductConfigurationG
       final long backupMediaStorageAllowanceBytes) {
     this.configurationResponse = GetConfigurationResponse.newBuilder()
         .setBackup(buildBackupConfiguration(subscriptionConfiguration, backupMediaStorageAllowanceBytes))
-        .setSepaMaximumEuros(oneTimeDonationConfiguration.sepaMaximumEuros().toString())
+        .setSepaMaximumEuros(SubscriptionCurrencyUtil.convertPrimaryToMinorUnits(
+            OneTimeDonationUtil.EURO_CURRENCY_CODE, oneTimeDonationConfiguration.sepaMaximumEuros()))
         .putAllCurrencies(buildCurrencyConfigurations(subscriptionConfiguration, oneTimeDonationConfiguration, paymentProcessors))
         .putAllBadgeLevels(buildLevelConfigurations(subscriptionConfiguration, oneTimeDonationConfiguration))
         .setLogin(buildLoginConfiguration(loginPurchaseConfiguration))
@@ -66,11 +67,13 @@ public class ProductConfigurationGrpcService extends SimpleProductConfigurationG
     donationLevels.put(ReceiptLevel.ONE_TIME_DONATION.getValue(),
         LevelConfiguration.newBuilder()
             .setBadgeId(oneTimeDonationConfiguration.boost().badge())
-            .setBadgeDurationSeconds(oneTimeDonationConfiguration.boost().expiration().toSeconds()).build());
+            .setBadgeDurationSeconds(Math.toIntExact(oneTimeDonationConfiguration.boost().expiration().toSeconds()))
+            .build());
     donationLevels.put(ReceiptLevel.ONE_TIME_GIFT_DONATION.getValue(),
         LevelConfiguration.newBuilder()
             .setBadgeId(oneTimeDonationConfiguration.gift().badge())
-            .setBadgeDurationSeconds(oneTimeDonationConfiguration.gift().expiration().toSeconds()).build());
+            .setBadgeDurationSeconds(Math.toIntExact(oneTimeDonationConfiguration.gift().expiration().toSeconds()))
+            .build());
     return donationLevels;
   }
 
@@ -82,11 +85,11 @@ public class ProductConfigurationGrpcService extends SimpleProductConfigurationG
             e -> BackupLevelConfiguration.newBuilder()
                 .setStorageAllowanceBytes(backupMediaStorageAllowanceBytes)
                 .setPlayProductId(e.getValue().playProductId())
-                .setMediaTtlDays(e.getValue().mediaTtl().toDays())
+                .setMediaTtlDays(Math.toIntExact(e.getValue().mediaTtl().toDays()))
                 .build()));
     return BackupConfiguration.newBuilder()
         .putAllLevels(backupLevels)
-        .setFreeTierMediaDays(subscriptionConfiguration.getbackupFreeTierMediaDuration().toDays())
+        .setFreeTierMediaDays(Math.toIntExact(subscriptionConfiguration.getbackupFreeTierMediaDuration().toDays()))
         .build();
   }
 
@@ -102,20 +105,22 @@ public class ProductConfigurationGrpcService extends SimpleProductConfigurationG
 
   private static CurrencyConfiguration toProtoCurrencyConfiguration(
       final String currency,
-      final org.whispersystems.textsecuregcm.subscriptions.CurrencyConfiguration config) {
+      final org.whispersystems.textsecuregcm.purchases.CurrencyConfiguration config) {
     final CurrencyConfiguration.Builder builder = CurrencyConfiguration.newBuilder()
-        .setMinimum(config.minimum().toString())
+        .setMinimum(SubscriptionCurrencyUtil.convertPrimaryToMinorUnits(currency, config.minimum()))
         .addAllSupportedPaymentMethods(config.supportedPaymentMethods().stream()
             .map(PaymentMethod::toProtoPaymentMethod)
             .toList());
     config.oneTime().forEach((levelId, amounts) ->
         builder.putOneTime(levelId, AmountList.newBuilder()
-            .addAllAmounts(amounts.stream().map(BigDecimal::toString).toList())
+            .addAllAmounts(amounts.stream()
+                .map(amount -> SubscriptionCurrencyUtil.convertPrimaryToMinorUnits(currency, amount))
+                .toList())
             .build()));
     config.subscription()
-        .forEach((levelId, amount) -> builder.putSubscription(levelId, amount.toString()));
+        .forEach((levelId, amount) -> builder.putSubscription(levelId, SubscriptionCurrencyUtil.convertPrimaryToMinorUnits(currency, amount)));
     config.backupSubscription()
-        .forEach((levelId, amount) -> builder.putBackupSubscription(levelId, amount.toString()));
+        .forEach((levelId, amount) -> builder.putBackupSubscription(levelId, SubscriptionCurrencyUtil.convertPrimaryToMinorUnits(currency, amount)));
     return builder.build();
   }
 }

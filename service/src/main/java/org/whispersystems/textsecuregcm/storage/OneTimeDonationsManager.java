@@ -14,7 +14,7 @@ import java.util.Map;
 import java.util.Objects;
 import javax.annotation.Nonnull;
 import io.micrometer.core.instrument.Tags;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
 import org.whispersystems.textsecuregcm.util.AttributeValues;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
@@ -51,6 +51,8 @@ public class OneTimeDonationsManager {
 
     final GetItemResponse getItemResponse = dynamoDbClient.getItem(getItemRequest);
     if (!getItemResponse.hasItem()) {
+      // This can happen if the upstream call races the asynchronous webhook that notifies of payment success,
+      // and usually the `paidAt` will be within a few seconds of the fallback
       Metrics.counter(ONETIME_DONATION_NOT_FOUND_COUNTER_NAME, Tags.of("processor", paymentProvider.name())).increment();
       return fallbackTimestamp;
     }

@@ -140,8 +140,6 @@ dynamoDbTables:
     tableName: profilesV2_test
   pushChallenge:
     tableName: push_challenge_test
-  pushNotificationExperimentSamples:
-    tableName: Example_PushNotificationExperimentSamples
   redeemedReceipts:
     tableName: redeemed_receipts_test
   registrationRecovery:
@@ -151,6 +149,8 @@ dynamoDbTables:
     tableName: remote_config_test
   reportMessage:
     tableName: report_messages_test
+  sandboxAccounts:
+    tableName: sandbox_accounts_test
   scheduledJobs:
     tableName: scheduled_jobs_test
     expiration: P7D
@@ -580,6 +580,7 @@ foundationDbMessages:
 
 registrationWebAuthn:
   relyingPartyId: example.org
-  origin: https://example.org
+  origins:
+    - https://example.org
   challengeTtl: PT2M
   userHandleBlindingSecret: secret://registrationWebAuthn.userHandleBlindingSecret

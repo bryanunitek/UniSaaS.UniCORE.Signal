@@ -81,8 +81,7 @@ class FoundationDbMessagePublisherTest {
   @BeforeEach
   void setUp() {
     database = mock(Database.class);
-    ftDatabase = new FaultTolerantDatabase(database, getClass().getSimpleName() + "-testCircuitBreaker",
-        null);
+    ftDatabase = new FaultTolerantDatabase(database, getClass().getSimpleName() + "-testCircuitBreaker", null, null);
     stateTransitions = new ArrayList<>();
 
     final byte[] messageGuidCodecKey = new byte[16];
@@ -232,7 +231,7 @@ class FoundationDbMessagePublisherTest {
         .expectNext(getExpectedMessageStreamEntry(keyValue1))
         .expectNext(getExpectedMessageStreamEntry(keyValue2))
         .expectNext(getExpectedMessageStreamEntry(keyValue3))
-        .verifyTimeout(Duration.ofSeconds(1));
+        .verifyTimeout(Duration.ofMillis(100));
 
     assertEquals(List.of(
             FoundationDbMessagePublisher.State.FETCHING_MESSAGES, // Batch 1
@@ -373,7 +372,7 @@ class FoundationDbMessagePublisherTest {
     StepVerifier.create(infinitePublisher.getMessages())
         .expectNext(getExpectedMessageStreamEntry(keyValue1))
         .expectNext(getExpectedMessageStreamEntry(keyValue2))
-        .verifyTimeout(Duration.ofSeconds(1));
+        .verifyTimeout(Duration.ofMillis(100));
 
     assertEquals(List.of(
             FoundationDbMessagePublisher.State.FETCHING_MESSAGES, // Batch 1

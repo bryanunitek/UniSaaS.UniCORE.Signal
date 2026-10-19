@@ -22,6 +22,7 @@ import org.signal.chat.keys.SimpleKeysAnonymousGrpc;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.zkgroup.ServerSecretParams;
 import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessUtil;
+import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
@@ -47,6 +48,11 @@ public class KeysAnonymousGrpcService extends SimpleKeysAnonymousGrpc.KeysAnonym
   public GetPreKeysAnonymousResponse getPreKeys(final GetPreKeysAnonymousRequest request) {
     final ServiceIdentifier serviceIdentifier =
         GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getRequest().getTargetIdentifier());
+
+    if (serviceIdentifier.identityType() == IdentityType.PNI
+        && request.getAuthorizationCase() != GetPreKeysAnonymousRequest.AuthorizationCase.GROUP_SEND_TOKEN) {
+      throw GrpcExceptions.fieldViolation("authorization", "group send token is required for PNI targets");
+    }
 
     final byte deviceId = request.getRequest().hasDeviceId()
         ? DeviceIdUtil.validate(request.getRequest().getDeviceId())

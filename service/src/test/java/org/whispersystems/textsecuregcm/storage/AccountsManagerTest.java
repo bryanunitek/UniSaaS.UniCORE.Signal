@@ -80,7 +80,6 @@ import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
-import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.function.Executable;
@@ -90,6 +89,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junitpioneer.jupiter.cartesian.CartesianTest;
+import org.mockito.ArgumentCaptor;
 import org.mockito.stubbing.Answer;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.protocol.ecc.ECKeyPair;
@@ -108,6 +108,7 @@ import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClient;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
 import org.whispersystems.textsecuregcm.securestorage.SecureStorageClient;
@@ -123,6 +124,7 @@ import org.whispersystems.textsecuregcm.util.Pair;
 import org.whispersystems.textsecuregcm.util.TestClock;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 import org.whispersystems.textsecuregcm.util.ThrowingSupplier;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
 
 @Timeout(value = 10, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 class AccountsManagerTest {
@@ -138,15 +140,16 @@ class AccountsManagerTest {
 
   private static final byte[] LINK_DEVICE_SECRET = "link-device-secret".getBytes(StandardCharsets.UTF_8);
 
-  private static final Duration MAX_TOTP_VALIDATION_DELAY = AccountsManager.TOTP.getTimeStep().dividedBy(2);
+  private static final Duration MAX_TOTP_VALIDATION_DELAY = TotpManager.TOTP.getTimeStep().dividedBy(2);
 
-  private static final TotpParameters TOTP_PARAMETERS = new TotpParameters(AccountsManager.TOTP.getAlgorithm(),
-      AccountsManager.TOTP.getPasswordLength(),
-      AccountsManager.TOTP.getTimeStep());
+  private static final TotpParameters TOTP_PARAMETERS = new TotpParameters(TotpManager.TOTP.getAlgorithm(),
+      TotpManager.TOTP.getPasswordLength(),
+      TotpManager.TOTP.getTimeStep());
 
   private static TestClock CLOCK;
 
   private Accounts accounts;
+  private SandboxAccounts sandboxAccounts;
   private PhoneNumberIdentifiers phoneNumberIdentifiers;
   private KeysManager keysManager;
   private MessagesManager messagesManager;
@@ -174,6 +177,7 @@ class AccountsManagerTest {
   @BeforeEach
   void setup() throws Exception {
     accounts = mock(Accounts.class);
+    sandboxAccounts = mock(SandboxAccounts.class);
     keysManager = mock(KeysManager.class);
     messagesManager = mock(MessagesManager.class);
     profilesManager = mock(ProfilesManager.class);
@@ -266,12 +270,13 @@ class AccountsManagerTest {
         svr2Client,
         disconnectionRequestManager,
         phoneNumberRecoveryPasswordsManager,
+        sandboxAccounts,
         mock(ScheduledExecutorService.class),
         mock(ScheduledExecutorService.class),
         CLOCK,
         LINK_DEVICE_SECRET,
-        MAX_TOTP_VALIDATION_DELAY,
-        webAuthnCeremonyManager);
+        webAuthnCeremonyManager,
+        new TotpManager(redisCluster, MAX_TOTP_VALIDATION_DELAY));
   }
 
   @ParameterizedTest
@@ -837,7 +842,7 @@ class AccountsManagerTest {
   @ParameterizedTest
   @ValueSource(booleans = {false, true})
   void testCreateFreshAccount(final boolean hasE164)
-      throws AccountAlreadyExistsException, ReceiptAlreadyRedeemedException {
+      throws AccountAlreadyExistsException, ReceiptAlreadyRedeemedException, AccountCreationConditionException {
     when(accounts.create(any(), any())).thenReturn(true);
 
     final Optional<String> maybeE164 = hasE164 ? Optional.of("+18005550123") : Optional.empty();
@@ -887,12 +892,50 @@ class AccountsManagerTest {
     verifyNoInteractions(profilesManager);
   }
 
+  @Test
+  void testCreateSandboxAccount() throws Exception {
+    CLOCK.pin(Instant.now());
+    final UUID sandboxAci = UUID.randomUUID();
+    final TransactWriteItem claim = TransactWriteItem.builder().build();
+    when(sandboxAccounts.getAvailable()).thenReturn(List.of(sandboxAci));
+    when(sandboxAccounts.buildClaimWriteItem(sandboxAci, CLOCK.instant())).thenReturn(claim);
+
+    final Account createdAccount = createSandboxAccount(sandboxAccountAttributes());
+
+    assertEquals(sandboxAci, createdAccount.getAccountIdentifier());
+    assertTrue(createdAccount.getNumber().isEmpty());
+    assertTrue(createdAccount.getAuthCredentialSalt().isPresent());
+    verify(accounts).create(argThat(account -> sandboxAci.equals(account.getAccountIdentifier())), any(), any(), argThat(list -> list.contains(claim)));
+    verify(keysManager).buildWriteItemsForNewDevice(eq(sandboxAci), eq(Optional.empty()), eq(Device.PRIMARY_ID),
+        notNull(), eq(Optional.empty()), notNull(), eq(Optional.empty()));
+  }
+
+  @Test
+  void testCreateSandboxAccountIdentifierUnavailable() throws Exception {
+    final UUID firstAci = UUID.randomUUID();
+    final UUID secondAci = UUID.randomUUID();
+    when(sandboxAccounts.getAvailable()).thenReturn(List.of(firstAci, secondAci));
+    when(accounts.create(any(), any(), any(), any()))
+        .thenThrow(new AccountCreationConditionException(0))
+        .thenReturn(true);
+
+    final Account createdAccount = createSandboxAccount(sandboxAccountAttributes());
+
+    final ArgumentCaptor<Account> accountCaptor = ArgumentCaptor.forClass(Account.class);
+    verify(accounts, times(2)).create(accountCaptor.capture(), any(), any(), any());
+    final List<UUID> attemptedAcis =
+        accountCaptor.getAllValues().stream().map(Account::getAccountIdentifier).toList();
+
+    assertEquals(Set.of(firstAci, secondAci), Set.copyOf(attemptedAcis));
+    assertEquals(attemptedAcis.getLast(), createdAccount.getAccountIdentifier());
+  }
+
   @ParameterizedTest
   @MethodSource
   void testReregisterAccount(
       final Optional<String> maybeE164,
       final Optional<String> maybeExistingAccountE164)
-      throws AccountAlreadyExistsException, ReceiptAlreadyRedeemedException {
+      throws AccountAlreadyExistsException, ReceiptAlreadyRedeemedException, AccountCreationConditionException {
     final UUID existingUuid = UUID.randomUUID();
     final Integer pniRegistrationId = maybeE164.isPresent() ? 2 : null;
     final AccountAttributes attributes = new AccountAttributes(false, 1, pniRegistrationId, null, null, maybeE164.isPresent(), null,
@@ -1224,7 +1267,7 @@ class AccountsManagerTest {
 
   @ParameterizedTest
   @ValueSource(booleans = {true, false})
-  void testAddDevice(boolean accountHasPhoneNumber) throws LinkDeviceTokenAlreadyUsedException {
+  void testAddDevice(boolean accountHasPhoneNumber) throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final String phoneNumber =
         PhoneNumberUtil.getInstance().format(PhoneNumberUtil.getInstance().getExampleNumber("US"),
             PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -1270,7 +1313,7 @@ class AccountsManagerTest {
             true,
             Optional.empty(),
             Optional.empty()),
-            accountsManager.generateLinkDeviceToken(aci));
+            accountsManager.generateLinkDeviceToken(account));
 
     verify(keysManager).deleteSingleUsePreKeys(aci, nextDeviceId);
     maybePni.ifPresent(pni -> verify(keysManager).deleteSingleUsePreKeys(pni, nextDeviceId));
@@ -1297,6 +1340,55 @@ class AccountsManagerTest {
     assertTrue(device.getFetchesMessages());
     assertNull(device.getApnId());
     assertNull(device.getGcmId());
+  }
+
+  @Test
+  void testAddDeviceExceedsMaxDevices() {
+    final List<Device> devices = IntStream.range(0, AccountsManager.MAX_DEVICES - 1)
+        .mapToObj(i -> {
+          final Device device = generateTestDevice(CLOCK.millis());
+          device.setId((byte) (Device.PRIMARY_ID + i));
+          return device;
+        })
+        .toList();
+
+    final Account account = AccountsHelper.generateTestAccount("+14152222222", devices);
+    final UUID aci = account.getAccountIdentifier();
+    account.setIdentityKey(new IdentityKey(ECKeyPair.generate().getPublicKey()));
+
+    final String linkDeviceToken = assertDoesNotThrow(() -> accountsManager.generateLinkDeviceToken(account),
+        "the account should still have a free device slot");
+
+    // Simulate a concurrent link request
+    final Device concurrentlyLinkedDevice = generateTestDevice(CLOCK.millis());
+    concurrentlyLinkedDevice.setId(account.getNextDeviceId());
+    account.addDevice(concurrentlyLinkedDevice);
+
+    when(accounts.getByAccountIdentifier(aci)).thenReturn(Optional.of(account));
+
+    final ECKeyPair aciKeyPair = ECKeyPair.generate();
+    final ECKeyPair pniKeyPair = ECKeyPair.generate();
+
+    final DeviceLimitExceededException exception = assertThrows(DeviceLimitExceededException.class,
+        () -> accountsManager.addDevice(aci,
+            new DeviceSpec(
+                "device-name".getBytes(StandardCharsets.UTF_8),
+                "password",
+                "OWT",
+                Set.of(),
+                new DeviceIdentityInfo(17, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+                Optional.of(new DeviceIdentityInfo(19, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
+                true,
+                Optional.empty(),
+                Optional.empty()),
+            linkDeviceToken));
+
+    assertEquals(AccountsManager.MAX_DEVICES, exception.getCurrentDevices());
+    assertEquals(AccountsManager.MAX_DEVICES, exception.getMaxDevices());
+
+    verify(accounts, never()).updateTransactionally(any(), any());
+    verifyNoInteractions(keysManager);
+    verifyNoInteractions(messagesManager);
   }
 
   @ParameterizedTest
@@ -1726,9 +1818,38 @@ class AccountsManagerTest {
   private Account createAccount(final AccountAttributes accountAttributes) throws ReceiptAlreadyRedeemedException {
     final ECKeyPair aciKeyPair = ECKeyPair.generate();
 
+    final ReceiptCredentialPresentation receiptCredentialPresentation = mock(ReceiptCredentialPresentation.class);
+    when(receiptCredentialPresentation.getReceiptLevel()).thenReturn(ReceiptLevel.LOGIN.getValue());
     return accountsManager.create(accountAttributes,
         new IdentityKey(aciKeyPair.getPublicKey()),
-        mock(ReceiptCredentialPresentation.class),
+        receiptCredentialPresentation,
+        new DeviceSpec(
+            accountAttributes.getName(),
+            "password",
+            null,
+            accountAttributes.getCapabilities(),
+            new DeviceIdentityInfo(accountAttributes.getRegistrationId(), KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+            Optional.empty(),
+            accountAttributes.getFetchesMessages(),
+            Optional.empty(),
+            Optional.empty()),
+        null);
+  }
+
+  private static AccountAttributes sandboxAccountAttributes() {
+    return new AccountAttributes(false, 1, null, null, null, false, null, TestRandomUtil.nextBytes(16));
+  }
+
+  private Account createSandboxAccount(final AccountAttributes accountAttributes)
+      throws ReceiptAlreadyRedeemedException {
+    final ECKeyPair aciKeyPair = ECKeyPair.generate();
+
+    final ReceiptCredentialPresentation receiptCredentialPresentation = mock(ReceiptCredentialPresentation.class);
+    when(receiptCredentialPresentation.getReceiptLevel()).thenReturn(ReceiptLevel.LOGIN_SANDBOX.getValue());
+
+    return accountsManager.create(accountAttributes,
+        new IdentityKey(aciKeyPair.getPublicKey()),
+        receiptCredentialPresentation,
         new DeviceSpec(
             accountAttributes.getName(),
             "password",
@@ -1766,11 +1887,31 @@ class AccountsManagerTest {
   }
 
   @Test
-  void checkDeviceLinkingToken() {
-    final UUID aci = UUID.randomUUID();
+  void checkDeviceLinkingToken() throws Exception {
+    final Account account = createAccount(new AccountAttributes(false, 1, 2, null, null, false, null,
+        TestRandomUtil.nextBytes(16)));
 
-    assertEquals(Optional.of(aci),
-        accountsManager.checkDeviceLinkingToken(accountsManager.generateLinkDeviceToken(aci)));
+    assertEquals(Optional.of(account.getAccountIdentifier()),
+        accountsManager.checkDeviceLinkingToken(accountsManager.generateLinkDeviceToken(account)));
+  }
+
+  static List<Arguments> isCanonicallyBase64UrlEncoded() {
+    final byte[] bytes = new byte[32];
+    final String canonical = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    return List.of(
+        Arguments.argumentSet("Canonical", canonical, bytes, true),
+        Arguments.argumentSet("Missing padding", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", bytes, false),
+        Arguments.argumentSet("Extra bits", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB=", bytes, false),
+        Arguments.argumentSet("Extra bits, missing padding", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD", bytes, false)
+    );
+  }
+
+  @ParameterizedTest
+  @MethodSource
+  void isCanonicallyBase64UrlEncoded(final String encoded, final byte[] bytes, final boolean expectCanonical) {
+    assertArrayEquals(bytes, Base64.getUrlDecoder().decode(encoded));
+    assertEquals(expectCanonical, AccountsManager.isCanonicallyBase64UrlEncoded(encoded, bytes));
   }
 
   @ParameterizedTest
@@ -2004,7 +2145,7 @@ class AccountsManagerTest {
       final Instant timestamp = Instant.now();
 
       assertEquals(Optional.of(nextTotpKeyId), accountsManager.confirmPendingTotpKey(accountIdentifier,
-          AccountsManager.TOTP.generateOneTimePassword(pendingTotpKey, timestamp),
+          TotpManager.TOTP.generateOneTimePassword(pendingTotpKey, timestamp),
           timestamp,
           TestRandomUtil.nextBytes(16)));
 
@@ -2028,18 +2169,18 @@ class AccountsManagerTest {
       when(account.getNextMfaKeyId()).thenReturn(nextTotpKeyId);
 
       final Instant beginningOfTotpWindow = totpWindowStart(Instant.now());
-      final int oneTimePassword = AccountsManager.TOTP.generateOneTimePassword(pendingTotpKey, beginningOfTotpWindow);
+      final int oneTimePassword = TotpManager.TOTP.generateOneTimePassword(pendingTotpKey, beginningOfTotpWindow);
 
       // Should be rejected since even after delay allowance, our otp is from the previous window
       assertEquals(Optional.empty(), accountsManager.confirmPendingTotpKey(accountIdentifier,
           oneTimePassword,
-          beginningOfTotpWindow.plus(AccountsManager.TOTP.getTimeStep()).plus(MAX_TOTP_VALIDATION_DELAY),
+          beginningOfTotpWindow.plus(TotpManager.TOTP.getTimeStep()).plus(MAX_TOTP_VALIDATION_DELAY),
           TestRandomUtil.nextBytes(16)));
 
       // Should still be accepted as MAX_TOTP_VALIDATION_DELAY delay brings us to the otp's window
       assertEquals(Optional.of(nextTotpKeyId), accountsManager.confirmPendingTotpKey(accountIdentifier,
           oneTimePassword,
-          beginningOfTotpWindow.plus(AccountsManager.TOTP.getTimeStep())
+          beginningOfTotpWindow.plus(TotpManager.TOTP.getTimeStep())
               .plus(MAX_TOTP_VALIDATION_DELAY)
               .minus(Duration.ofMillis(1)),
           TestRandomUtil.nextBytes(16)));
@@ -2058,8 +2199,8 @@ class AccountsManagerTest {
 
       final AnnotatedTotpKey confirmedTotpKey;
       {
-        final KeyGenerator totpKeyGenerator = KeyGenerator.getInstance(AccountsManager.TOTP.getAlgorithm());
-        totpKeyGenerator.init(AccountsManager.getTotpKeyLengthBits());
+        final KeyGenerator totpKeyGenerator = KeyGenerator.getInstance(TotpManager.TOTP.getAlgorithm());
+        totpKeyGenerator.init(TotpManager.getTotpKeyLengthBits());
 
         confirmedTotpKey = new AnnotatedTotpKey(
             new TotpKey(TOTP_PARAMETERS, totpKeyGenerator.generateKey().getEncoded()),
@@ -2076,7 +2217,7 @@ class AccountsManagerTest {
       final Instant timestamp = Instant.now();
 
       assertEquals(Optional.of(keyId), accountsManager.confirmPendingTotpKey(accountIdentifier,
-          AccountsManager.TOTP.generateOneTimePassword(confirmedTotpKey, timestamp),
+          TotpManager.TOTP.generateOneTimePassword(confirmedTotpKey, timestamp),
           timestamp,
           TestRandomUtil.nextBytes(16)));
     }
@@ -2099,7 +2240,7 @@ class AccountsManagerTest {
       final Instant timestamp = Instant.now();
 
       assertEquals(Optional.empty(), accountsManager.confirmPendingTotpKey(accountIdentifier,
-          AccountsManager.TOTP.generateOneTimePassword(pendingTotpKey, timestamp),
+          TotpManager.TOTP.generateOneTimePassword(pendingTotpKey, timestamp),
           timestamp,
           TestRandomUtil.nextBytes(16)));
     }
@@ -2122,7 +2263,7 @@ class AccountsManagerTest {
       when(account.getNextMfaKeyId()).thenReturn(nextTotpKeyId);
 
       final Instant timestamp = Instant.now();
-      final int incorrectPassword = AccountsManager.TOTP.generateOneTimePassword(pendingTotpKey, timestamp) + 1;
+      final int incorrectPassword = TotpManager.TOTP.generateOneTimePassword(pendingTotpKey, timestamp) + 1;
 
       assertEquals(Optional.empty(), accountsManager.confirmPendingTotpKey(accountIdentifier,
           incorrectPassword,
@@ -2133,94 +2274,9 @@ class AccountsManagerTest {
     }
   }
 
-  @ParameterizedTest
-  @MethodSource
-  void verifyTotp(final Map<Byte, AnnotatedMfaKey> mfaKeys,
-      final Instant timestamp,
-      @Nullable final Integer oneTimePassword,
-      final boolean expectVerified) {
-
-    final Account account = mock(Account.class);
-    when(account.getMfaKeys()).thenReturn(mfaKeys);
-
-    assertEquals(expectVerified, accountsManager.verifyTotp(account, timestamp, oneTimePassword));
-  }
-
-  private static List<Arguments> verifyTotp() throws NoSuchAlgorithmException, InvalidKeyException {
-    final Instant timestamp = Instant.now();
-
-    final AnnotatedTotpKey totpKey;
-    final AnnotatedTotpKey secondTotpKey;
-    {
-      final KeyGenerator totpKeyGenerator = KeyGenerator.getInstance(AccountsManager.TOTP.getAlgorithm());
-      totpKeyGenerator.init(AccountsManager.getTotpKeyLengthBits());
-
-      totpKey = new AnnotatedTotpKey(
-          new TotpKey(TOTP_PARAMETERS, totpKeyGenerator.generateKey().getEncoded()),
-          TestRandomUtil.nextBytes(16));
-
-      secondTotpKey = new AnnotatedTotpKey(
-          new TotpKey(TOTP_PARAMETERS, totpKeyGenerator.generateKey().getEncoded()),
-          TestRandomUtil.nextBytes(16));
-    }
-
-    return List.of(
-        Arguments.argumentSet("No keys, no password provided",
-            Collections.emptyMap(), timestamp, null, true),
-
-        Arguments.argumentSet("No keys, password provided",
-            Collections.emptyMap(), timestamp, 123456, false),
-
-        Arguments.argumentSet("Has key, correct password provided",
-            Map.of((byte) 1, totpKey), timestamp, AccountsManager.TOTP.generateOneTimePassword(totpKey, timestamp), true),
-
-        Arguments.argumentSet("Has key, incorrect password provided",
-            Map.of((byte) 1, totpKey), timestamp, AccountsManager.TOTP.generateOneTimePassword(totpKey, timestamp) + 1, false),
-
-        Arguments.argumentSet("Has key, no password provided",
-            Map.of((byte) 1, totpKey), timestamp, null, false),
-
-        Arguments.argumentSet("Has multiple keys, correct password provided for one key",
-            Map.of((byte) 1, totpKey, (byte) 2, secondTotpKey), timestamp, AccountsManager.TOTP.generateOneTimePassword(totpKey, timestamp), true)
-    );
-  }
-
-  @RepeatedTest(value = 10, failureThreshold = 2)
-  void verifyTotpWithDelay() throws NoSuchAlgorithmException, InvalidKeyException, TooManyMfaKeysException {
-    final AnnotatedTotpKey totpKey;
-    {
-      final KeyGenerator totpKeyGenerator = KeyGenerator.getInstance(AccountsManager.TOTP.getAlgorithm());
-      totpKeyGenerator.init(AccountsManager.getTotpKeyLengthBits());
-
-      totpKey = new AnnotatedTotpKey(
-          new TotpKey(TOTP_PARAMETERS, totpKeyGenerator.generateKey().getEncoded()),
-          TestRandomUtil.nextBytes(16));
-    }
-
-    final Account account = mock(Account.class);
-    when(account.getMfaKeys()).thenReturn(Map.of((byte) 1, totpKey));
-
-    final Instant beginningOfTotpWindow = totpWindowStart(Instant.now());
-    final int oneTimePassword = AccountsManager.TOTP.generateOneTimePassword(totpKey, beginningOfTotpWindow);
-
-    assertTrue(accountsManager.verifyTotp(account, beginningOfTotpWindow, oneTimePassword),
-        "One-time password should be valid at the start of the window in which it was generated");
-
-    assertTrue(accountsManager.verifyTotp(account, beginningOfTotpWindow.plus(AccountsManager.TOTP.getTimeStep()), oneTimePassword),
-        "One-time password should be valid at the start of the window after which it was generated");
-
-    assertTrue(accountsManager.verifyTotp(account, beginningOfTotpWindow.plus(AccountsManager.TOTP.getTimeStep()).plus(MAX_TOTP_VALIDATION_DELAY).minusMillis(1), oneTimePassword),
-        "One-time password should be valid up until max delay after end of current TOTP window");
-
-    // With six-digit OTPs, there's a one-in-a-million chance of this returning a false positive, and so we repeat the
-    // test several allowing for failure
-    assertFalse(accountsManager.verifyTotp(account, beginningOfTotpWindow.plus(AccountsManager.TOTP.getTimeStep()).plus(MAX_TOTP_VALIDATION_DELAY), oneTimePassword),
-        "One-time password should not be valid after max delay past end of current TOTP window");
-  }
-
   private static Instant totpWindowStart(final Instant instant) {
-    return Instant.ofEpochMilli((instant.toEpochMilli() / AccountsManager.TOTP.getTimeStep().toMillis()) *
-        AccountsManager.TOTP.getTimeStep().toMillis());
+    return Instant.ofEpochMilli((instant.toEpochMilli() / TotpManager.TOTP.getTimeStep().toMillis()) *
+        TotpManager.TOTP.getTimeStep().toMillis());
   }
 
   @Nested

@@ -8,7 +8,6 @@ package org.whispersystems.textsecuregcm.grpc;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -20,17 +19,15 @@ import static org.mockito.Mockito.when;
 
 import com.google.common.net.InetAddresses;
 import com.google.protobuf.ByteString;
+import io.grpc.Status;
 import java.io.IOException;
-import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.stream.Stream;
-import io.grpc.Status;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -39,14 +36,14 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.Mock;
 import org.signal.chat.purchase.CreatePayPalPaymentMethodRequest;
 import org.signal.chat.purchase.CreatePayPalPaymentMethodResponse;
-import org.signal.chat.purchase.CreatePaymentMethodRequest;
-import org.signal.chat.purchase.CreatePaymentMethodResponse;
+import org.signal.chat.purchase.CreateStripePaymentMethodRequest;
+import org.signal.chat.purchase.CreateStripePaymentMethodResponse;
 import org.signal.chat.purchase.DeleteSubscriberRequest;
 import org.signal.chat.purchase.DeleteSubscriberResponse;
 import org.signal.chat.purchase.GetBankMandateRequest;
 import org.signal.chat.purchase.GetBankMandateResponse;
-import org.signal.chat.purchase.GetReceiptCredentialsRequest;
-import org.signal.chat.purchase.GetReceiptCredentialsResponse;
+import org.signal.chat.purchase.GetReceiptCredentialRequest;
+import org.signal.chat.purchase.GetReceiptCredentialResponse;
 import org.signal.chat.purchase.GetSubscriptionInformationRequest;
 import org.signal.chat.purchase.GetSubscriptionInformationResponse;
 import org.signal.chat.purchase.PaymentMethod;
@@ -72,33 +69,32 @@ import org.whispersystems.textsecuregcm.storage.DonationPermits;
 import org.whispersystems.textsecuregcm.storage.DonationPermitsManager;
 import org.whispersystems.textsecuregcm.storage.SubscriptionManager;
 import org.whispersystems.textsecuregcm.storage.Subscriptions;
-import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreManager;
-import org.whispersystems.textsecuregcm.subscriptions.BankMandateTranslator;
-import org.whispersystems.textsecuregcm.subscriptions.BankTransferType;
-import org.whispersystems.textsecuregcm.subscriptions.BraintreeManager;
-import org.whispersystems.textsecuregcm.subscriptions.ChargeFailure;
-import org.whispersystems.textsecuregcm.subscriptions.GooglePlayBillingManager;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
-import org.whispersystems.textsecuregcm.subscriptions.ProcessorCustomer;
-import org.whispersystems.textsecuregcm.subscriptions.StripeManager;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriberIdCreationNotPermittedException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionChargeFailurePaymentRequiredException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionForbiddenException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInformation;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInvalidArgumentsException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInvalidIdempotencyKeyException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInvalidLevelException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionNotFoundException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionPaymentProcessor;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionPaymentRequiredException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionPaymentRequiresActionException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionPrice;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionProcessorConflictException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionProcessorException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionReceiptAlreadyRedeemedException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionReceiptRequestedForOpenPaymentException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionStatus;
+import org.whispersystems.textsecuregcm.purchases.AppleAppStoreManager;
+import org.whispersystems.textsecuregcm.purchases.BankMandateTranslator;
+import org.whispersystems.textsecuregcm.purchases.BankTransferType;
+import org.whispersystems.textsecuregcm.purchases.BraintreeManager;
+import org.whispersystems.textsecuregcm.purchases.ChargeFailure;
+import org.whispersystems.textsecuregcm.purchases.GooglePlayBillingManager;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
+import org.whispersystems.textsecuregcm.purchases.ProcessorCustomer;
+import org.whispersystems.textsecuregcm.purchases.StripeManager;
+import org.whispersystems.textsecuregcm.purchases.SubscriberIdCreationNotPermittedException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseForbiddenException;
+import org.whispersystems.textsecuregcm.purchases.SubscriptionInformation;
+import org.whispersystems.textsecuregcm.purchases.PurchaseInvalidArgumentsException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseInvalidIdempotencyKeyException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseInvalidLevelException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseNotFoundException;
+import org.whispersystems.textsecuregcm.purchases.SubscriptionPaymentProcessor;
+import org.whispersystems.textsecuregcm.purchases.PurchasePaymentRequiredException;
+import org.whispersystems.textsecuregcm.purchases.PurchasePaymentRequiresActionException;
+import org.whispersystems.textsecuregcm.purchases.SubscriptionPrice;
+import org.whispersystems.textsecuregcm.purchases.PurchaseProcessorConflictException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseProcessorException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseReceiptAlreadyRedeemedException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseReceiptRequestedForOpenPaymentException;
+import org.whispersystems.textsecuregcm.purchases.SubscriptionStatus;
 import org.whispersystems.textsecuregcm.tests.util.SubscriptionConfigTestHelper;
 import org.whispersystems.textsecuregcm.util.TestClock;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
@@ -165,7 +161,7 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void updateSubscriberCreationNotPermittedPermitRejected() throws SubscriptionException {
+  void updateSubscriberCreationNotPermittedPermitRejected() throws PurchaseException {
     doThrow(new SubscriberIdCreationNotPermittedException())
         .when(subscriptionManager).updateSubscriber(any(), eq(false));
 
@@ -182,7 +178,7 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void updateSubscriberCreationNotPermittedMissingPermit() throws SubscriptionException {
+  void updateSubscriberCreationNotPermittedMissingPermit() throws PurchaseException {
     doThrow(new SubscriberIdCreationNotPermittedException())
         .when(subscriptionManager).updateSubscriber(any(), eq(false));
     GrpcTestUtils.assertStatusInvalidArgument(() -> unauthenticatedServiceStub().updateSubscriber(
@@ -192,8 +188,8 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void updateSubscriberIdMismatch() throws SubscriptionException {
-    doThrow(new SubscriptionForbiddenException("subscriberId mismatch"))
+  void updateSubscriberIdMismatch() throws PurchaseException {
+    doThrow(new PurchaseForbiddenException("subscriberId mismatch"))
         .when(subscriptionManager).updateSubscriber(any(), anyBoolean());
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT, () -> unauthenticatedServiceStub().updateSubscriber(
         UpdateSubscriberRequest.newBuilder()
@@ -212,8 +208,8 @@ public class SubscriptionsGrpcServiceTest extends
 
   @Test
   void deleteSubscriberNotFound()
-      throws SubscriptionNotFoundException, SubscriptionInvalidArgumentsException, RateLimitExceededException {
-    doThrow(new SubscriptionNotFoundException())
+      throws PurchaseNotFoundException, PurchaseInvalidArgumentsException, RateLimitExceededException {
+    doThrow(new PurchaseNotFoundException())
         .when(subscriptionManager).deleteSubscriber(any());
     final DeleteSubscriberResponse response = unauthenticatedServiceStub().deleteSubscriber(
         DeleteSubscriberRequest.newBuilder()
@@ -224,8 +220,8 @@ public class SubscriptionsGrpcServiceTest extends
 
   @Test
   void deleteSubscriberCannotCancel()
-      throws SubscriptionNotFoundException, SubscriptionInvalidArgumentsException, RateLimitExceededException {
-    doThrow(new SubscriptionInvalidArgumentsException("cannot cancel subscription"))
+      throws PurchaseNotFoundException, PurchaseInvalidArgumentsException, RateLimitExceededException {
+    doThrow(new PurchaseInvalidArgumentsException("cannot cancel subscription"))
         .when(subscriptionManager).deleteSubscriber(any());
     final DeleteSubscriberResponse response = unauthenticatedServiceStub().deleteSubscriber(
         DeleteSubscriberRequest.newBuilder()
@@ -237,28 +233,24 @@ public class SubscriptionsGrpcServiceTest extends
   @ParameterizedTest
   @EnumSource(value = PaymentMethod.class, names = {"PAYMENT_METHOD_CARD", "PAYMENT_METHOD_SEPA_DEBIT",
       "PAYMENT_METHOD_IDEAL"})
-  void createPaymentMethod(final PaymentMethod paymentMethod)
-      throws SubscriptionForbiddenException, SubscriptionNotFoundException, SubscriptionProcessorConflictException {
+  void createStripePaymentMethod(final PaymentMethod paymentMethod)
+      throws PurchaseForbiddenException, PurchaseNotFoundException, PurchaseProcessorConflictException {
     when(subscriptionManager.addPaymentMethodToCustomer(any(), any(), any(), any())).thenReturn("test-client-secret");
-    when(stripeManager.getProvider()).thenReturn(PaymentProvider.STRIPE);
 
-    final CreatePaymentMethodRequest.Builder builder = CreatePaymentMethodRequest.newBuilder()
+    final CreateStripePaymentMethodRequest.Builder builder = CreateStripePaymentMethodRequest.newBuilder()
         .setSubscriberId(SUBSCRIBER_ID)
         .setDonationPermit(ByteString.copyFrom(getDonationPermit().serialize()))
         .setPaymentMethod(paymentMethod);
-    final CreatePaymentMethodResponse response = unauthenticatedServiceStub().createPaymentMethod(builder.build());
-    assertEquals(CreatePaymentMethodResponse.ResponseCase.RESULT, response.getResponseCase());
-    // Currently, only stripe is chosen as the payment provider for all supported payment methods
-    assertEquals(org.signal.chat.purchase.PaymentProvider.PAYMENT_PROVIDER_STRIPE,
-        response.getResult().getPaymentProvider());
+    final CreateStripePaymentMethodResponse response = unauthenticatedServiceStub().createStripePaymentMethod(builder.build());
+    assertEquals(CreateStripePaymentMethodResponse.ResponseCase.RESULT, response.getResponseCase());
     assertEquals("test-client-secret", response.getResult().getClientSecret());
   }
 
   @Test
   void createPaymentMethodUnsupportedPaymentMethod() {
     GrpcTestUtils.assertStatusInvalidArgument(
-        () -> unauthenticatedServiceStub().createPaymentMethod(
-            CreatePaymentMethodRequest.newBuilder()
+        () -> unauthenticatedServiceStub().createStripePaymentMethod(
+            CreateStripePaymentMethodRequest.newBuilder()
                 .setSubscriberId(SUBSCRIBER_ID)
                 .setPaymentMethod(PaymentMethod.PAYMENT_METHOD_PAYPAL)
                 .build()));
@@ -267,8 +259,8 @@ public class SubscriptionsGrpcServiceTest extends
   @Test
   void createPaymentMethodInvalidDonationPermit() {
     GrpcTestUtils.assertStatusInvalidArgument(
-        () -> unauthenticatedServiceStub().createPaymentMethod(
-            CreatePaymentMethodRequest.newBuilder()
+        () -> unauthenticatedServiceStub().createStripePaymentMethod(
+            CreateStripePaymentMethodRequest.newBuilder()
                 .setSubscriberId(SUBSCRIBER_ID)
                 .setDonationPermit(ByteString.copyFrom(new byte[]{1}))
                 .setPaymentMethod(PaymentMethod.PAYMENT_METHOD_CARD)
@@ -282,8 +274,8 @@ public class SubscriptionsGrpcServiceTest extends
     final DonationPermit donationPermit = getDonationPermit();
     clock.pin(clock.instant().plus(Duration.ofDays(30)));
 
-    final CreatePaymentMethodResponse createPaymentMethodResponse = unauthenticatedServiceStub().createPaymentMethod(
-        CreatePaymentMethodRequest.newBuilder()
+    final CreateStripePaymentMethodResponse createPaymentMethodResponse = unauthenticatedServiceStub().createStripePaymentMethod(
+        CreateStripePaymentMethodRequest.newBuilder()
             .setSubscriberId(SUBSCRIBER_ID)
             .setDonationPermit(ByteString.copyFrom(donationPermit.serialize()))
             .setPaymentMethod(PaymentMethod.PAYMENT_METHOD_CARD)
@@ -294,21 +286,21 @@ public class SubscriptionsGrpcServiceTest extends
 
   @Test
   void createPaymentMethodProcessorConflict()
-      throws SubscriptionForbiddenException, SubscriptionNotFoundException, SubscriptionProcessorConflictException {
-    doThrow(new SubscriptionProcessorConflictException())
+      throws PurchaseForbiddenException, PurchaseNotFoundException, PurchaseProcessorConflictException {
+    doThrow(new PurchaseProcessorConflictException())
         .when(subscriptionManager).addPaymentMethodToCustomer(any(), any(), any(), any());
-    final CreatePaymentMethodResponse response = unauthenticatedServiceStub().createPaymentMethod(
-        CreatePaymentMethodRequest.newBuilder()
+    final CreateStripePaymentMethodResponse response = unauthenticatedServiceStub().createStripePaymentMethod(
+        CreateStripePaymentMethodRequest.newBuilder()
             .setSubscriberId(SUBSCRIBER_ID)
             .setDonationPermit(ByteString.copyFrom(getDonationPermit().serialize()))
             .setPaymentMethod(PaymentMethod.PAYMENT_METHOD_CARD)
             .build());
-    assertEquals(CreatePaymentMethodResponse.ResponseCase.SUBSCRIPTION_PROCESSOR_CONFLICT, response.getResponseCase());
+    assertEquals(CreateStripePaymentMethodResponse.ResponseCase.SUBSCRIPTION_PROCESSOR_CONFLICT, response.getResponseCase());
   }
 
   @Test
   void createPayPalPaymentMethod()
-      throws SubscriptionForbiddenException, SubscriptionNotFoundException, SubscriptionProcessorConflictException {
+      throws PurchaseForbiddenException, PurchaseNotFoundException, PurchaseProcessorConflictException {
     final BraintreeManager.PayPalBillingAgreementApprovalDetails details =
         new BraintreeManager.PayPalBillingAgreementApprovalDetails("https://fake-approval", "test-billing-token");
     when(subscriptionManager.addPaymentMethodToCustomer(any(), any(), any(), any()))
@@ -326,8 +318,8 @@ public class SubscriptionsGrpcServiceTest extends
 
   @Test
   void createPayPalPaymentMethodProcessorConflict()
-      throws SubscriptionForbiddenException, SubscriptionNotFoundException, SubscriptionProcessorConflictException {
-    doThrow(new SubscriptionProcessorConflictException())
+      throws PurchaseForbiddenException, PurchaseNotFoundException, PurchaseProcessorConflictException {
+    doThrow(new PurchaseProcessorConflictException())
         .when(subscriptionManager).addPaymentMethodToCustomer(any(), any(), any(), any());
     final CreatePayPalPaymentMethodResponse response = unauthenticatedServiceStub().createPayPalPaymentMethod(
         CreatePayPalPaymentMethodRequest.newBuilder()
@@ -342,7 +334,7 @@ public class SubscriptionsGrpcServiceTest extends
   @ParameterizedTest
   @EnumSource(value = SetDefaultPaymentMethodRequest.RequestCase.class, names = {"STRIPE", "BRAINTREE", "SEPA"})
   void setDefaultPaymentMethod(final SetDefaultPaymentMethodRequest.RequestCase requestCase)
-      throws SubscriptionNotFoundException, SubscriptionForbiddenException, IOException, SubscriptionProcessorConflictException {
+      throws PurchaseNotFoundException, PurchaseForbiddenException, IOException, PurchaseProcessorConflictException {
     final PaymentProvider provider = requestCase == SetDefaultPaymentMethodRequest.RequestCase.BRAINTREE
         ? PaymentProvider.BRAINTREE : PaymentProvider.STRIPE;
     final Subscriptions.Record record = mock(Subscriptions.Record.class);
@@ -379,8 +371,8 @@ public class SubscriptionsGrpcServiceTest extends
 
   @Test
   void setDefaultPaymentMethodSubscriptionNotFound()
-      throws SubscriptionNotFoundException, SubscriptionForbiddenException {
-    doThrow(new SubscriptionNotFoundException())
+      throws PurchaseNotFoundException, PurchaseForbiddenException {
+    doThrow(new PurchaseNotFoundException())
         .when(subscriptionManager).getSubscriber(any());
     final SetDefaultPaymentMethodResponse response = unauthenticatedServiceStub().setDefaultPaymentMethod(
         SetDefaultPaymentMethodRequest.newBuilder()
@@ -392,7 +384,7 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void setDefaultPaymentMethodNoCustomer() throws SubscriptionNotFoundException, SubscriptionForbiddenException {
+  void setDefaultPaymentMethodNoCustomer() throws PurchaseNotFoundException, PurchaseForbiddenException {
     final Subscriptions.Record record = mock(Subscriptions.Record.class);
     when(record.getProcessorCustomer()).thenReturn(Optional.empty());
     when(subscriptionManager.getSubscriber(any())).thenReturn(record);
@@ -402,10 +394,10 @@ public class SubscriptionsGrpcServiceTest extends
             .setStripe(SetDefaultPaymentMethodRequest.StripePaymentMethod.newBuilder()
                 .setPaymentMethodToken("test-token").build())
             .build());
-    assertEquals(SetDefaultPaymentMethodResponse.ResponseCase.PAYMENT_METHOD_NOT_SET_UP, response.getResponseCase());
+    assertEquals(SetDefaultPaymentMethodResponse.ResponseCase.FAILED_PRECONDITION, response.getResponseCase());
   }
 
-  private void mockValidSubscription() throws SubscriptionNotFoundException, SubscriptionForbiddenException {
+  private void mockValidSubscription() throws PurchaseNotFoundException, PurchaseForbiddenException {
     final Subscriptions.Record record = mock(Subscriptions.Record.class);
     when(record.getProcessorCustomer()).thenReturn(
         Optional.of(new ProcessorCustomer("test-customer", PaymentProvider.STRIPE)));
@@ -413,7 +405,7 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void setSubscriptionLevel() throws SubscriptionException {
+  void setSubscriptionLevel() throws PurchaseException {
     mockValidSubscription();
     final SetSubscriptionLevelResponse response = unauthenticatedServiceStub().setSubscriptionLevel(
         SetSubscriptionLevelRequest.newBuilder()
@@ -423,12 +415,11 @@ public class SubscriptionsGrpcServiceTest extends
             .setIdempotencyKey("test-idempotency-key")
             .build());
     assertEquals(SetSubscriptionLevelResponse.ResponseCase.SUCCESS, response.getResponseCase());
-    assertEquals(LEVEL, response.getSuccess().getLevel());
   }
 
   @Test
-  void setSubscriptionLevelNotFound() throws SubscriptionNotFoundException, SubscriptionForbiddenException {
-    doThrow(new SubscriptionNotFoundException())
+  void setSubscriptionLevelNotFound() throws PurchaseNotFoundException, PurchaseForbiddenException {
+    doThrow(new PurchaseNotFoundException())
         .when(subscriptionManager).getSubscriber(any());
     final SetSubscriptionLevelResponse response = unauthenticatedServiceStub().setSubscriptionLevel(
         SetSubscriptionLevelRequest.newBuilder()
@@ -439,7 +430,7 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void setSubscriptionLevelNoCustomer() throws SubscriptionNotFoundException, SubscriptionForbiddenException {
+  void setSubscriptionLevelNoCustomer() throws PurchaseNotFoundException, PurchaseForbiddenException {
     final Subscriptions.Record record = mock(Subscriptions.Record.class);
     when(record.getProcessorCustomer()).thenReturn(Optional.empty());
     when(subscriptionManager.getSubscriber(any())).thenReturn(record);
@@ -448,11 +439,11 @@ public class SubscriptionsGrpcServiceTest extends
             .setSubscriberId(SUBSCRIBER_ID)
             .setLevel(LEVEL).setCurrency(CURRENCY).setIdempotencyKey("test-idempotency-key")
             .build());
-    assertEquals(SetSubscriptionLevelResponse.ResponseCase.PAYMENT_METHOD_NOT_SET_UP, response.getResponseCase());
+    assertEquals(SetSubscriptionLevelResponse.ResponseCase.FAILED_PRECONDITION, response.getResponseCase());
   }
 
   @Test
-  void setSubscriptionLevelUnsupportedLevel() throws SubscriptionNotFoundException, SubscriptionForbiddenException {
+  void setSubscriptionLevelUnsupportedLevel() throws PurchaseNotFoundException, PurchaseForbiddenException {
     final Subscriptions.Record record = mock(Subscriptions.Record.class);
     when(record.getProcessorCustomer()).thenReturn(
         Optional.of(new ProcessorCustomer("test-customer", PaymentProvider.STRIPE)));
@@ -462,11 +453,11 @@ public class SubscriptionsGrpcServiceTest extends
             .setSubscriberId(SUBSCRIBER_ID)
             .setLevel(999L).setCurrency(CURRENCY).setIdempotencyKey("test-idempotency-key")
             .build());
-    assertEquals(SetSubscriptionLevelResponse.ResponseCase.UNSUPPORTED_LEVEL, response.getResponseCase());
+    assertEquals(SetSubscriptionLevelResponse.ResponseCase.INVALID_SELECTION, response.getResponseCase());
   }
 
   @Test
-  void setSubscriptionLevelUnsupportedCurrency() throws SubscriptionNotFoundException, SubscriptionForbiddenException {
+  void setSubscriptionLevelUnsupportedCurrency() throws PurchaseNotFoundException, PurchaseForbiddenException {
     final Subscriptions.Record record = mock(Subscriptions.Record.class);
     when(record.getProcessorCustomer()).thenReturn(
         Optional.of(new ProcessorCustomer("test-customer", PaymentProvider.STRIPE)));
@@ -476,14 +467,13 @@ public class SubscriptionsGrpcServiceTest extends
             .setSubscriberId(SUBSCRIBER_ID)
             .setLevel(LEVEL).setCurrency("xyz").setIdempotencyKey("test-idempotency-key")
             .build());
-    assertEquals(SetSubscriptionLevelResponse.ResponseCase.UNSUPPORTED_CURRENCY, response.getResponseCase());
+    assertEquals(SetSubscriptionLevelResponse.ResponseCase.INVALID_SELECTION, response.getResponseCase());
   }
 
   @ParameterizedTest
   @MethodSource
-  void setSubscriptionLevelUpdateExceptions(final SubscriptionException exception,
-      final SetSubscriptionLevelResponse.ResponseCase expectedCase)
-      throws SubscriptionException {
+  void setSubscriptionLevelUpdateFailedPreconditionExceptions(final PurchaseException exception)
+      throws PurchaseException {
     mockValidSubscription();
     doThrow(exception).when(subscriptionManager).updateSubscriptionLevelForCustomer(
         any(), any(), any(), anyLong(), any(), any(), any(), any());
@@ -492,27 +482,23 @@ public class SubscriptionsGrpcServiceTest extends
             .setSubscriberId(SUBSCRIBER_ID)
             .setLevel(LEVEL).setCurrency(CURRENCY).setIdempotencyKey("test-idempotency-key")
             .build());
-    assertEquals(expectedCase, response.getResponseCase());
+    assertEquals(SetSubscriptionLevelResponse.ResponseCase.FAILED_PRECONDITION, response.getResponseCase());
   }
 
-  static Stream<Arguments> setSubscriptionLevelUpdateExceptions() {
+  static Stream<Arguments> setSubscriptionLevelUpdateFailedPreconditionExceptions() {
     return Stream.of(
-        Arguments.of(new SubscriptionInvalidIdempotencyKeyException("bad key"),
-            SetSubscriptionLevelResponse.ResponseCase.INVALID_IDEMPOTENCY_KEY),
-        Arguments.of(new SubscriptionPaymentRequiresActionException(),
-            SetSubscriptionLevelResponse.ResponseCase.PAYMENT_REQUIRES_ACTION),
-        Arguments.of(new SubscriptionInvalidLevelException(),
-            SetSubscriptionLevelResponse.ResponseCase.INVALID_LEVEL_TRANSITION),
-        Arguments.of(new SubscriptionProcessorConflictException(),
-            SetSubscriptionLevelResponse.ResponseCase.SUBSCRIPTION_PROCESSOR_CONFLICT)
+        Arguments.of(new PurchaseInvalidIdempotencyKeyException("bad key")),
+        Arguments.of(new PurchasePaymentRequiresActionException()),
+        Arguments.of(new PurchaseInvalidLevelException()),
+        Arguments.of(new PurchaseProcessorConflictException())
     );
   }
 
   @Test
   void setSubscriptionLevelChargeFailure()
-      throws SubscriptionException {
+      throws PurchaseException {
     mockValidSubscription();
-    doThrow(new SubscriptionProcessorException(PaymentProvider.STRIPE,
+    doThrow(new PurchaseProcessorException(PaymentProvider.STRIPE,
         new ChargeFailure("card_declined", "Insufficient funds", null, null, null)))
         .when(subscriptionManager).updateSubscriptionLevelForCustomer(
             any(), any(), any(), anyLong(), any(), any(), any(), any());
@@ -521,18 +507,18 @@ public class SubscriptionsGrpcServiceTest extends
             .setSubscriberId(SUBSCRIBER_ID)
             .setLevel(LEVEL).setCurrency(CURRENCY).setIdempotencyKey("test-idempotency-key")
             .build());
-    assertEquals(SetSubscriptionLevelResponse.ResponseCase.CHARGE_FAILURE, response.getResponseCase());
+    assertEquals(SetSubscriptionLevelResponse.ResponseCase.PAYMENT_REQUIRED, response.getResponseCase());
     assertEquals(org.signal.chat.purchase.PaymentProvider.PAYMENT_PROVIDER_STRIPE,
-        response.getChargeFailure().getProcessor());
-    assertEquals("card_declined", response.getChargeFailure().getCode());
-    assertEquals("Insufficient funds", response.getChargeFailure().getMessage());
+        response.getPaymentRequired().getChargeFailure().getProcessor());
+    assertEquals("card_declined", response.getPaymentRequired().getChargeFailure().getCode());
+    assertEquals("Insufficient funds", response.getPaymentRequired().getChargeFailure().getMessage());
   }
 
   @Test
   void getSubscriptionInformation()
-      throws SubscriptionNotFoundException, SubscriptionForbiddenException, RateLimitExceededException {
+      throws PurchaseNotFoundException, PurchaseForbiddenException, RateLimitExceededException {
     final SubscriptionInformation info = new SubscriptionInformation(
-        new SubscriptionPrice(CURRENCY, BigDecimal.valueOf(500)),
+        new SubscriptionPrice(CURRENCY, 500),
         LEVEL,
         Instant.ofEpochSecond(100),
         Instant.ofEpochSecond(1000),
@@ -540,7 +526,7 @@ public class SubscriptionsGrpcServiceTest extends
         false,
         SubscriptionStatus.ACTIVE,
         PaymentProvider.STRIPE,
-        org.whispersystems.textsecuregcm.subscriptions.PaymentMethod.CARD,
+        org.whispersystems.textsecuregcm.purchases.PaymentMethod.CARD,
         false,
         null);
     when(subscriptionManager.getSubscriptionInformation(any())).thenReturn(Optional.of(info));
@@ -562,7 +548,7 @@ public class SubscriptionsGrpcServiceTest extends
 
   @Test
   void getSubscriptionInformationNoSubscription()
-      throws SubscriptionNotFoundException, SubscriptionForbiddenException, RateLimitExceededException {
+      throws PurchaseNotFoundException, PurchaseForbiddenException, RateLimitExceededException {
     when(subscriptionManager.getSubscriptionInformation(any())).thenReturn(Optional.empty());
     final GetSubscriptionInformationResponse response = unauthenticatedServiceStub().getSubscriptionInformation(
         GetSubscriptionInformationRequest.newBuilder()
@@ -572,39 +558,39 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void getReceiptCredentials() throws Exception {
+  void getReceiptCredential() throws Exception {
     final ReceiptCredentialResponse receiptCredentialResponse = mock(ReceiptCredentialResponse.class);
     final byte[] responseBytes = TestRandomUtil.nextBytes(16);
     when(receiptCredentialResponse.serialize()).thenReturn(responseBytes);
-    when(subscriptionManager.createReceiptCredentials(any(), any(), any(), any()))
+    when(subscriptionManager.createReceiptCredential(any(), any(), any(), any()))
         .thenReturn(new SubscriptionManager.ReceiptResult(receiptCredentialResponse, new SubscriptionPaymentProcessor.ReceiptItem("test-item-id", null, 5), PaymentProvider.STRIPE));
-    final GetReceiptCredentialsResponse response = unauthenticatedServiceStub().getReceiptCredentials(
-        GetReceiptCredentialsRequest.newBuilder()
+    final GetReceiptCredentialResponse response = unauthenticatedServiceStub().getReceiptCredential(
+        GetReceiptCredentialRequest.newBuilder()
             .setSubscriberId(SUBSCRIBER_ID)
             .setReceiptCredentialRequest(ByteString.copyFrom(TestRandomUtil.nextBytes(97)))
             .build());
-    assertEquals(GetReceiptCredentialsResponse.ResponseCase.SUCCESS, response.getResponseCase());
+    assertEquals(GetReceiptCredentialResponse.ResponseCase.SUCCESS, response.getResponseCase());
     assertArrayEquals(responseBytes, response.getSuccess().getReceiptCredentialResponse().toByteArray());
   }
 
-  static Stream<Arguments> getReceiptCredentialsExceptions() {
+  static Stream<Arguments> getReceiptCredentialExceptions() {
     return Stream.of(
-        Arguments.of(new SubscriptionReceiptRequestedForOpenPaymentException(),
-            GetReceiptCredentialsResponse.ResponseCase.NO_PAID_INVOICE),
-        Arguments.of(new SubscriptionPaymentRequiredException(),
-            GetReceiptCredentialsResponse.ResponseCase.PAYMENT_REQUIRED),
-        Arguments.of(new SubscriptionReceiptAlreadyRedeemedException(),
-            GetReceiptCredentialsResponse.ResponseCase.ALREADY_REDEEMED)
+        Arguments.of(new PurchaseReceiptRequestedForOpenPaymentException(),
+            GetReceiptCredentialResponse.ResponseCase.NO_PAID_INVOICE),
+        Arguments.of(new PurchasePaymentRequiredException(PaymentProvider.STRIPE),
+            GetReceiptCredentialResponse.ResponseCase.PAYMENT_REQUIRED),
+        Arguments.of(new PurchaseReceiptAlreadyRedeemedException(),
+            GetReceiptCredentialResponse.ResponseCase.ALREADY_REDEEMED)
     );
   }
 
   @ParameterizedTest
   @MethodSource
-  void getReceiptCredentialsExceptions(final SubscriptionException exception,
-      final GetReceiptCredentialsResponse.ResponseCase expectedCase) throws Exception {
-    doThrow(exception).when(subscriptionManager).createReceiptCredentials(any(), any(), any(), any());
-    final GetReceiptCredentialsResponse response = unauthenticatedServiceStub().getReceiptCredentials(
-        GetReceiptCredentialsRequest.newBuilder()
+  void getReceiptCredentialExceptions(final PurchaseException exception,
+      final GetReceiptCredentialResponse.ResponseCase expectedCase) throws Exception {
+    doThrow(exception).when(subscriptionManager).createReceiptCredential(any(), any(), any(), any());
+    final GetReceiptCredentialResponse response = unauthenticatedServiceStub().getReceiptCredential(
+        GetReceiptCredentialRequest.newBuilder()
             .setSubscriberId(SUBSCRIBER_ID)
             .setReceiptCredentialRequest(ByteString.copyFrom(TestRandomUtil.nextBytes(97)))
             .build());
@@ -612,16 +598,16 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void getReceiptCredentialsChargeFailure() throws Exception {
-    doThrow(new SubscriptionChargeFailurePaymentRequiredException(PaymentProvider.STRIPE,
+  void getReceiptCredentialChargeFailure() throws Exception {
+    doThrow(new PurchasePaymentRequiredException(PaymentProvider.STRIPE,
         new ChargeFailure("card_declined", "Insufficient funds", null, null, null)))
-        .when(subscriptionManager).createReceiptCredentials(any(), any(), any(), any());
-    final GetReceiptCredentialsResponse response = unauthenticatedServiceStub().getReceiptCredentials(
-        GetReceiptCredentialsRequest.newBuilder()
+        .when(subscriptionManager).createReceiptCredential(any(), any(), any(), any());
+    final GetReceiptCredentialResponse response = unauthenticatedServiceStub().getReceiptCredential(
+        GetReceiptCredentialRequest.newBuilder()
             .setSubscriberId(SUBSCRIBER_ID)
             .setReceiptCredentialRequest(ByteString.copyFrom(TestRandomUtil.nextBytes(97)))
             .build());
-    assertEquals(GetReceiptCredentialsResponse.ResponseCase.PAYMENT_REQUIRED, response.getResponseCase());
+    assertEquals(GetReceiptCredentialResponse.ResponseCase.PAYMENT_REQUIRED, response.getResponseCase());
     assertEquals(org.signal.chat.purchase.PaymentProvider.PAYMENT_PROVIDER_STRIPE,
         response.getPaymentRequired().getChargeFailure().getProcessor());
     assertEquals("card_declined", response.getPaymentRequired().getChargeFailure().getCode());
@@ -630,7 +616,7 @@ public class SubscriptionsGrpcServiceTest extends
   @ParameterizedTest
   @EnumSource(value = SetIapSubscriptionRequest.RequestCase.class, names = {"APP_STORE", "PLAY_BILLING"})
   void setIapSubscription(final SetIapSubscriptionRequest.RequestCase requestCase)
-      throws SubscriptionException, RateLimitExceededException {
+      throws PurchaseException, RateLimitExceededException {
     when(subscriptionManager.updateAppStoreTransactionId(any(), any(), any())).thenReturn(LEVEL);
     when(subscriptionManager.updatePlayBillingPurchaseToken(any(), any(), any())).thenReturn(LEVEL);
     final SetIapSubscriptionRequest.Builder builder = SetIapSubscriptionRequest.newBuilder()
@@ -659,22 +645,22 @@ public class SubscriptionsGrpcServiceTest extends
 
   static Stream<Arguments> setIapSubscriptionExceptions() {
     return Stream.of(
-        Arguments.of(new SubscriptionNotFoundException(),
+        Arguments.of(new PurchaseNotFoundException(),
             SetIapSubscriptionResponse.ResponseCase.SUBSCRIBER_NOT_FOUND),
-        Arguments.of(new SubscriptionProcessorConflictException(),
+        Arguments.of(new PurchaseProcessorConflictException(),
             SetIapSubscriptionResponse.ResponseCase.SUBSCRIPTION_PROCESSOR_CONFLICT),
-        Arguments.of(new SubscriptionPaymentRequiredException(),
+        Arguments.of(new PurchasePaymentRequiredException(PaymentProvider.GOOGLE_PLAY_BILLING),
             SetIapSubscriptionResponse.ResponseCase.PAYMENT_REQUIRED),
-        Arguments.of(new SubscriptionInvalidArgumentsException("invalid"),
+        Arguments.of(new PurchaseInvalidArgumentsException("invalid"),
             SetIapSubscriptionResponse.ResponseCase.INVALID_TRANSACTION)
     );
   }
 
   @ParameterizedTest
   @MethodSource
-  void setIapSubscriptionExceptions(final SubscriptionException exception,
+  void setIapSubscriptionExceptions(final PurchaseException exception,
       final SetIapSubscriptionResponse.ResponseCase expectedCase)
-      throws SubscriptionException, RateLimitExceededException {
+      throws PurchaseException, RateLimitExceededException {
     doThrow(exception).when(subscriptionManager).updateAppStoreTransactionId(any(), any(), any());
     final SetIapSubscriptionResponse response = unauthenticatedServiceStub().setIapSubscription(
         SetIapSubscriptionRequest.newBuilder()

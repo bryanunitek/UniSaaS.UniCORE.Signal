@@ -132,11 +132,12 @@ class AccountsManagerConcurrentModificationIntegrationTest {
           mock(SecureValueRecoveryClient.class),
           mock(DisconnectionRequestManager.class),
           phoneNumberRecoveryPasswordsManager,
+          mock(SandboxAccounts.class),
           mock(ScheduledExecutorService.class),
           mock(ScheduledExecutorService.class),
           mock(Clock.class),
           "link-device-secret".getBytes(StandardCharsets.UTF_8),
-          AccountsManager.TOTP.getTimeStep().dividedBy(2),
+          null,
           null
       );
     }

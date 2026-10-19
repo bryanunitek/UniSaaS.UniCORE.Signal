@@ -18,8 +18,6 @@ import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.auth.DisconnectionRequestListener;
 import org.whispersystems.textsecuregcm.auth.DisconnectionRequestManager;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
-import org.whispersystems.textsecuregcm.limits.MessageDeliveryLoopMonitor;
 import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
@@ -39,7 +37,6 @@ import reactor.adapter.JdkFlowAdapter;
 import reactor.core.observability.micrometer.Micrometer;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import reactor.core.publisher.Signal;
 import reactor.core.publisher.Sinks;
 
 /// A MessageDispatcher is used to stream messages to an authenticated device and coordinates message acknowledgement,
@@ -69,7 +66,6 @@ public class MessageDispatcher {
   private final PushNotificationManager pushNotificationManager;
   private final PushNotificationScheduler pushNotificationScheduler;
   private final ClientReleaseManager clientReleaseManager;
-  private final MessageDeliveryLoopMonitor messageDeliveryLoopMonitor;
   private final DisconnectionRequestManager disconnectionRequestManager;
 
   public MessageDispatcher(final ReceiptSender receiptSender,
@@ -77,7 +73,6 @@ public class MessageDispatcher {
       final MessageMetrics messageMetrics,
       final PushNotificationManager pushNotificationManager,
       final PushNotificationScheduler pushNotificationScheduler,
-      final MessageDeliveryLoopMonitor messageDeliveryLoopMonitor,
       final DisconnectionRequestManager disconnectionRequestManager,
       final ClientReleaseManager clientReleaseManager) {
     this.receiptSender = receiptSender;
@@ -85,7 +80,6 @@ public class MessageDispatcher {
     this.messageMetrics = messageMetrics;
     this.pushNotificationManager = pushNotificationManager;
     this.pushNotificationScheduler = pushNotificationScheduler;
-    this.messageDeliveryLoopMonitor = messageDeliveryLoopMonitor;
     this.disconnectionRequestManager = disconnectionRequestManager;
     this.clientReleaseManager = clientReleaseManager;
   }
@@ -140,12 +134,6 @@ public class MessageDispatcher {
         .name(SEND_MESSAGES_FLUX_NAME)
         .tap(Micrometer.metrics(Metrics.globalRegistry))
         .limitRate(MESSAGE_PUBLISHER_LIMIT_RATE)
-
-        // Check the first message we send for message-delivery loops
-        .switchOnFirst((firstEntry, flux) -> {
-          recordDeliveryAttempt(account, device, userAgentString, firstEntry);
-          return flux;
-        })
         .flatMapSequential(entry -> switch (entry) {
           case MessageStreamEntry.Envelope(final MessageProtos.Envelope envelope) -> {
             final UUID serverGuid = UUIDUtil.fromByteString(envelope.getServerGuid());
@@ -235,17 +223,6 @@ public class MessageDispatcher {
       disconnectionRequestManager.addListener(account.getAccountIdentifier(), device.getId(), listener);
       sink.onDispose(() -> disconnectionRequestManager.removeListener(account.getAccountIdentifier(), device.getId(), listener));
     });
-  }
-
-  private void recordDeliveryAttempt(final Account account, final Device device, final String userAgent,
-      final Signal<? extends MessageStreamEntry> firstEntry) {
-    if (firstEntry.get() instanceof MessageStreamEntry.Envelope(final MessageProtos.Envelope message)) {
-      messageDeliveryLoopMonitor.recordDeliveryAttempt(account.getAccountIdentifier(),
-          device.getId(),
-          UUIDUtil.fromByteString(message.getServerGuid()),
-          userAgent,
-          MessageMetrics.GRPC_CHANNEL);
-    }
   }
 
   private void maybeSendDeliveryReceipt(

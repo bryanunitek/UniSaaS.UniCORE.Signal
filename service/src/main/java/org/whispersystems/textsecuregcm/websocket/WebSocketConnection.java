@@ -20,11 +20,9 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import javax.annotation.Nullable;
-import org.apache.commons.lang3.StringUtils;
 import org.eclipse.jetty.util.ConstantThrowable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,7 +30,6 @@ import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
 import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
-import org.whispersystems.textsecuregcm.limits.MessageDeliveryLoopMonitor;
 import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
@@ -46,6 +43,7 @@ import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.MessageStream;
 import org.whispersystems.textsecuregcm.storage.MessageStreamEntry;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
+import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.HeaderUtils;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import org.whispersystems.textsecuregcm.util.ua.UserAgent;
@@ -71,7 +69,6 @@ public class WebSocketConnection {
       "sendMessageError");
 
   private static final String STATUS_CODE_TAG = "status";
-  private static final String STATUS_MESSAGE_TAG = "message";
   private static final String ERROR_TYPE_TAG = "errorType";
   private static final String EXCEPTION_TYPE_TAG = "exceptionType";
 
@@ -90,7 +87,6 @@ public class WebSocketConnection {
   private final MessageMetrics messageMetrics;
   private final PushNotificationManager pushNotificationManager;
   private final PushNotificationScheduler pushNotificationScheduler;
-  private final MessageDeliveryLoopMonitor messageDeliveryLoopMonitor;
   private final ExperimentEnrollmentManager experimentEnrollmentManager;
 
   private final Account authenticatedAccount;
@@ -117,7 +113,6 @@ public class WebSocketConnection {
       final WebSocketClient client,
       final Scheduler messageDeliveryScheduler,
       final ClientReleaseManager clientReleaseManager,
-      final MessageDeliveryLoopMonitor messageDeliveryLoopMonitor,
       final ExperimentEnrollmentManager experimentEnrollmentManager) {
 
     this.receiptSender = receiptSender;
@@ -130,7 +125,6 @@ public class WebSocketConnection {
     this.client = client;
     this.messageDeliveryScheduler = messageDeliveryScheduler;
     this.clientReleaseManager = clientReleaseManager;
-    this.messageDeliveryLoopMonitor = messageDeliveryLoopMonitor;
     this.experimentEnrollmentManager = experimentEnrollmentManager;
 
     this.messageStream =
@@ -143,7 +137,6 @@ public class WebSocketConnection {
     pushNotificationManager.handleMessagesRetrieved(authenticatedAccount, authenticatedDevice, client.getUserAgent());
 
     final Timer.Sample queueDrainStart = Timer.start();
-    final AtomicBoolean hasSentFirstMessage = new AtomicBoolean();
 
     messageSubscription.set(JdkFlowAdapter.flowPublisherToFlux(messageStream.getMessages())
         .name(SEND_MESSAGES_FLUX_NAME)
@@ -156,17 +149,6 @@ public class WebSocketConnection {
         .doOnError(ConflictingMessageConsumerException.class, _ -> {
           messageMetrics.measureMessageStreamDisplaced(MessageMetrics.WEBSOCKET_CHANNEL, userAgent, true);
           client.close(4409, "Connected elsewhere");
-        })
-        .doOnNext(entry -> {
-          if (entry instanceof MessageStreamEntry.Envelope(final Envelope message)) {
-            if (hasSentFirstMessage.compareAndSet(false, true)) {
-              messageDeliveryLoopMonitor.recordDeliveryAttempt(authenticatedAccount.getAccountIdentifier(),
-                  authenticatedDevice.getId(),
-                  UUIDUtil.fromByteString(message.getServerGuid()),
-                  client.getUserAgent(),
-                  MessageMetrics.WEBSOCKET_CHANNEL);
-            }
-          }
         })
         .flatMapSequential(entry -> switch (entry) {
           case MessageStreamEntry.Envelope envelope -> Mono.fromFuture(() -> sendMessage(envelope.message())).thenReturn(entry);
@@ -280,11 +262,6 @@ public class WebSocketConnection {
           } else {
             Tags tags = Tags.of(UserAgentTagUtil.getPlatformTag(userAgent), Tag.of(STATUS_CODE_TAG, String.valueOf(response.getStatus())));
 
-            // TODO Remove this once we've identified the cause of message rejections from desktop clients
-            if (StringUtils.isNotBlank(response.getMessage())) {
-              tags = tags.and(Tag.of(STATUS_MESSAGE_TAG, response.getMessage()));
-            }
-
             Metrics.counter(NON_SUCCESS_RESPONSE_COUNTER_NAME, tags).increment();
 
             result = CompletableFuture.completedFuture(null);
@@ -311,6 +288,8 @@ public class WebSocketConnection {
       errorType = "timeout";
     } else if (isConnectionClosedException(e)) {
       errorType = "connectionClosed";
+    } else if (ExceptionUtils.isBreakerOpen(e)) {
+      errorType = "breakerOpen";
     } else {
       logger.warn("Send message failed", e);
       errorType = "other";

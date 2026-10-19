@@ -37,6 +37,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junitpioneer.jupiter.cartesian.CartesianTest;
 import org.mockito.Mock;
 import org.signal.chat.common.EcPreKey;
@@ -61,6 +63,7 @@ import org.whispersystems.textsecuregcm.entities.ECPreKey;
 import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
+import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
@@ -141,25 +144,33 @@ class KeysAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<KeysAnonymousGrpcS
     assertEquals(expectedResponse, response);
   }
 
-  @Test
-  void getPreKeysGroupSendEndorsement() throws Exception {
+  @ParameterizedTest
+  @EnumSource(IdentityType.class)
+  void getPreKeysGroupSendEndorsement(final IdentityType identityType) throws Exception {
     final Account targetAccount = mock(Account.class);
 
-    final Device targetDevice = DevicesHelper.createDevice(Device.PRIMARY_ID);
+    final int aciRegistrationId = 7;
+    final int pniRegistrationId = 17;
+    final Device targetDevice = DevicesHelper.createDevice(Device.PRIMARY_ID, 0, aciRegistrationId);
+    targetDevice.setPhoneNumberIdentityRegistrationId(pniRegistrationId);
     when(targetAccount.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(targetDevice));
 
-    final ECKeyPair identityKeyPair = ECKeyPair.generate();
-    final IdentityKey identityKey = new IdentityKey(identityKeyPair.getPublicKey());
-    final UUID uuid = UUID.randomUUID();
-    final AciServiceIdentifier identifier = new AciServiceIdentifier(uuid);
+    final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
+    final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+    final UUID aci = UUID.randomUUID();
+    final org.whispersystems.textsecuregcm.identity.ServiceIdentifier identifier = switch (identityType) {
+      case ACI -> new AciServiceIdentifier(aci);
+      case PNI -> new PniServiceIdentifier(UUID.randomUUID());
+    };
     final byte[] unidentifiedAccessKey = TestRandomUtil.nextBytes(UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH);
 
     when(targetAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(unidentifiedAccessKey));
-    when(targetAccount.getAccountIdentifier()).thenReturn(uuid);
-    when(targetAccount.getAccountIdentityKey()).thenReturn(identityKey);
-    when(accountsManager.getByServiceIdentifier(identifier))
-        .thenReturn(Optional.of(targetAccount));
+    when(targetAccount.getAccountIdentifier()).thenReturn(aci);
+    when(targetAccount.getAccountIdentityKey()).thenReturn(new IdentityKey(aciIdentityKeyPair.getPublicKey()));
+    when(targetAccount.getPhoneNumberIdentityKey()).thenReturn(Optional.of(new IdentityKey(pniIdentityKeyPair.getPublicKey())));
+    when(accountsManager.getByServiceIdentifier(identifier)).thenReturn(Optional.of(targetAccount));
 
+    final ECKeyPair identityKeyPair = identityType == IdentityType.ACI ? aciIdentityKeyPair : pniIdentityKeyPair;
     final ECPreKey ecPreKey = new ECPreKey(1, ECKeyPair.generate().getPublicKey());
     final ECSignedPreKey ecSignedPreKey = KeysHelper.signedECPreKey(2, identityKeyPair);
     final KEMSignedPreKey kemSignedPreKey = KeysHelper.signedKEMPreKey(3, identityKeyPair);
@@ -181,18 +192,22 @@ class KeysAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<KeysAnonymousGrpcS
             .setDeviceId(Device.PRIMARY_ID))
         .build());
 
-    final GetPreKeysAnonymousResponse expectedResponse = GetPreKeysAnonymousResponse.newBuilder()
-        .setPreKeys(AccountPreKeyBundles.newBuilder()
-            .setIdentityKey(ByteString.copyFrom(identityKey.serialize()))
-            .setUnidentifiedAccessKeyFingerprint(ByteString.copyFrom(UnidentifiedAccessChecksum.generateFor(unidentifiedAccessKey)))
-            .putDevicePreKeys(Device.PRIMARY_ID, DevicePreKeyBundle.newBuilder()
-                .setEcOneTimePreKey(toGrpcEcPreKey(ecPreKey))
-                .setEcSignedPreKey(toGrpcEcSignedPreKey(ecSignedPreKey))
-                .setKemOneTimePreKey(toGrpcKemSignedPreKey(kemSignedPreKey))
-                .build()))
-        .build();
+    final AccountPreKeyBundles.Builder expectedPreKeys = AccountPreKeyBundles.newBuilder()
+        .setIdentityKey(ByteString.copyFrom(identityKeyPair.getPublicKey().serialize()))
+        .putDevicePreKeys(Device.PRIMARY_ID, DevicePreKeyBundle.newBuilder()
+            .setEcOneTimePreKey(toGrpcEcPreKey(ecPreKey))
+            .setEcSignedPreKey(toGrpcEcSignedPreKey(ecSignedPreKey))
+            .setKemOneTimePreKey(toGrpcKemSignedPreKey(kemSignedPreKey))
+            .setRegistrationId(identityType == IdentityType.ACI ? aciRegistrationId : pniRegistrationId)
+            .build());
 
-    assertEquals(expectedResponse, response);
+    // PNIs don't allow unidentified access, so their bundles never carry a UAK fingerprint
+    if (identityType == IdentityType.ACI) {
+      expectedPreKeys.setUnidentifiedAccessKeyFingerprint(
+          ByteString.copyFrom(UnidentifiedAccessChecksum.generateFor(unidentifiedAccessKey)));
+    }
+
+    assertEquals(GetPreKeysAnonymousResponse.newBuilder().setPreKeys(expectedPreKeys).build(), response);
   }
 
   @CartesianTest
@@ -368,7 +383,7 @@ class KeysAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<KeysAnonymousGrpcS
             .setGroupSendToken(ByteString.copyFrom(token))
             .setRequest(GetPreKeysRequest.newBuilder()
                 .setTargetIdentifier(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(nonexistentAci)))
-        .build());
+            .build());
     assertTrue(preKeysResponse.hasTargetNotFound());
     verifyNoInteractions(keysManager);
   }
@@ -400,6 +415,31 @@ class KeysAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<KeysAnonymousGrpcS
             .build());
 
     assertTrue(response.hasFailedUnidentifiedAuthorization());
+  }
+
+  @ParameterizedTest
+  @EnumSource(value = GetPreKeysAnonymousRequest.AuthorizationCase.class, names = {"UNIDENTIFIED_ACCESS_KEY", "UNRESTRICTED_ACCESS"})
+  void getPreKeysPniInvalidArgument(final GetPreKeysAnonymousRequest.AuthorizationCase authorizationCase) {
+    final PniServiceIdentifier identifier = new PniServiceIdentifier(UUID.randomUUID());
+    final byte[] unidentifiedAccessKey = TestRandomUtil.nextBytes(UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH);
+
+    final Account targetAccount = mock(Account.class);
+    when(targetAccount.isUnrestrictedUnidentifiedAccess()).thenReturn(true);
+    when(targetAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(unidentifiedAccessKey));
+    when(accountsManager.getByServiceIdentifier(identifier)).thenReturn(Optional.of(targetAccount));
+
+    final GetPreKeysAnonymousRequest.Builder requestBuilder = GetPreKeysAnonymousRequest.newBuilder()
+        .setRequest(GetPreKeysRequest.newBuilder()
+            .setTargetIdentifier(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(identifier)));
+
+    switch (authorizationCase) {
+      case UNIDENTIFIED_ACCESS_KEY -> requestBuilder.setUnidentifiedAccessKey(ByteString.copyFrom(unidentifiedAccessKey));
+      case UNRESTRICTED_ACCESS -> requestBuilder.setUnrestrictedAccess(Empty.getDefaultInstance());
+      default -> throw new AssertionError("unexpected authorization case: " + authorizationCase);
+    }
+
+    GrpcTestUtils.assertStatusInvalidArgument(() -> unauthenticatedServiceStub().getPreKeys(requestBuilder.build()));
+    verifyNoInteractions(keysManager);
   }
 
   @Test

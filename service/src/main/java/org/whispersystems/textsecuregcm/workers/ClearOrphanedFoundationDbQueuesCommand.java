@@ -42,6 +42,7 @@ import org.whispersystems.textsecuregcm.storage.AccountLockManager;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FaultTolerantDatabase;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
+import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.ManagedExecutors;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -134,7 +135,8 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
         .map(entry -> {
           try {
             return new FaultTolerantDatabase(entry.getValue().build(fdb), entry.getKey(),
-                configuration.getFoundationDbMessagesConfiguration().circuitBreakerConfigurationName());
+                configuration.getFoundationDbMessagesConfiguration().circuitBreakerConfigurationName(),
+                configuration.getFoundationDbMessagesConfiguration().bulkheadConfigurationName());
           } catch (final IOException e) {
             throw new UncheckedIOException(e);
           }
@@ -190,7 +192,9 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
               accountLockManager, scheduler)
               .thenReturn(true)
               .onErrorResume(t -> {
-                logger.error("Failed to clear orphaned queue for ACI: {}", aci.uuid(), t);
+                if (!ExceptionUtils.isBreakerOpen(t)) {
+                  logger.error("Failed to clear orphaned queue for ACI: {}", aci.uuid(), t);
+                }
                 return Mono.just(false);
               });
         })
