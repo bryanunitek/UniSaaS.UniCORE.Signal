@@ -241,7 +241,6 @@ import org.whispersystems.textsecuregcm.push.ProvisioningManager;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
 import org.whispersystems.textsecuregcm.push.PushNotificationScheduler;
 import org.whispersystems.textsecuregcm.push.ReceiptSender;
-import org.whispersystems.textsecuregcm.push.RedisMessageAvailabilityManager;
 import org.whispersystems.textsecuregcm.redis.ConnectionEventLogger;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClient;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
@@ -269,7 +268,6 @@ import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.FoundationDbVersion;
 import org.whispersystems.textsecuregcm.storage.IssuedReceiptsManager;
 import org.whispersystems.textsecuregcm.storage.KeysManager;
-import org.whispersystems.textsecuregcm.storage.MessagesCache;
 import org.whispersystems.textsecuregcm.storage.MessagesDynamoDb;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
 import org.whispersystems.textsecuregcm.storage.OneTimeDonationsManager;
@@ -329,6 +327,7 @@ import org.whispersystems.textsecuregcm.websocket.AuthenticatedConnectListener;
 import org.whispersystems.textsecuregcm.websocket.NoContextTakeoverPerMessageDeflateExtension;
 import org.whispersystems.textsecuregcm.websocket.ProvisioningConnectListener;
 import org.whispersystems.textsecuregcm.websocket.WebSocketAccountAuthenticator;
+import org.whispersystems.textsecuregcm.websocket.WebSocketConnection;
 import org.whispersystems.textsecuregcm.workers.BackupMetricsCommand;
 import org.whispersystems.textsecuregcm.workers.BackupUsageRecalculationCommand;
 import org.whispersystems.textsecuregcm.workers.CertificateCommand;
@@ -339,7 +338,6 @@ import org.whispersystems.textsecuregcm.workers.ClearOrphanedFoundationDbQueuesC
 import org.whispersystems.textsecuregcm.workers.CopyToS3Command;
 import org.whispersystems.textsecuregcm.workers.DeleteUserCommand;
 import org.whispersystems.textsecuregcm.workers.IdleDeviceNotificationSchedulerFactory;
-import org.whispersystems.textsecuregcm.workers.MessagePersisterServiceCommand;
 import org.whispersystems.textsecuregcm.workers.NotifyIdleDevicesCommand;
 import org.whispersystems.textsecuregcm.workers.ProcessScheduledJobsServiceCommand;
 import org.whispersystems.textsecuregcm.workers.RegenerateSecondaryDynamoDbTableDataCommand;
@@ -401,7 +399,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     bootstrap.addCommand(new SetUserDiscoverabilityCommand());
     bootstrap.addCommand(new UnlinkDeviceCommand());
     bootstrap.addCommand(new ScheduledApnPushNotificationSenderServiceCommand());
-    bootstrap.addCommand(new MessagePersisterServiceCommand());
     bootstrap.addCommand(new RemoveExpiredAccountsCommand(Clock.systemUTC()));
     bootstrap.addCommand(new RemoveExpiredSandboxAccountsCommand(Clock.systemUTC()));
     bootstrap.addCommand(new SandboxAccountPoolCommand());
@@ -565,7 +562,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     BlockingQueue<Runnable> messageDeletionQueue = new LinkedBlockingQueue<>();
     Metrics.gaugeCollectionSize(name(getClass(), "messageDeletionQueueSize"), Collections.emptyList(),
         messageDeletionQueue);
-    ExecutorService messageDeletionAsyncExecutor = ExecutorServiceBuilder.of(environment, "messageDeletionAsyncExecutor")
+    final ExecutorService messageDeletionAsyncExecutor = ExecutorServiceBuilder.of(environment, "messageDeletionAsyncExecutor")
         .minThreads(2)
         .maxThreads(2)
         .allowCoreThreadTimeOut(true)
@@ -638,9 +635,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
 
     FaultTolerantRedisClusterClient cacheCluster = config.getCacheClusterConfiguration()
         .build("main_cache", sharedClientResources.mutate());
-    FaultTolerantRedisClusterClient messagesCluster =
-        config.getMessageCacheConfiguration().getRedisClusterConfiguration()
-            .build("messages", sharedClientResources.mutate());
     FaultTolerantRedisClusterClient pushSchedulerCluster = config.getPushSchedulerCluster().build("push_scheduler",
         sharedClientResources.mutate());
     FaultTolerantRedisClusterClient rateLimitersCluster = config.getRateLimitersCluster().build("rate_limiters",
@@ -797,8 +791,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         disconnectionRequestListenerExecutor, retryExecutor);
     ProfilesManager profilesManager = new ProfilesManager(profilesV1, profiles, profileAvatars, cacheCluster, retryExecutor, asyncCdnS3Client,
         config.getCdnConfiguration().bucket());
-    MessagesCache messagesCache = new MessagesCache(messagesCluster, messageDeliveryScheduler,
-        messageDeletionAsyncExecutor, retryExecutor, clock);
     final FoundationDbMessageStore foundationDbMessageStore = new FoundationDbMessageStore(messageDatabasesByEpoch,
         config.getFoundationDbMessagesConfiguration().activeEpoch(),
         new VersionstampUUIDCipher(config.getFoundationDbMessagesConfiguration().currentVersionstampCipherKey(),
@@ -813,11 +805,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         Clock.systemUTC());
     ReportMessageManager reportMessageManager = new ReportMessageManager(reportMessageDynamoDb, rateLimitersCluster,
         config.getReportMessageConfiguration().getCounterTtl());
-    RedisMessageAvailabilityManager redisMessageAvailabilityManager =
-        new RedisMessageAvailabilityManager(messagesCluster, clientEventExecutor, asyncOperationQueueingExecutor);
-    MessagesManager messagesManager =
-        new MessagesManager(messagesDynamoDb, messagesCache, foundationDbMessageStore, redisMessageAvailabilityManager,
-            reportMessageManager, messageDeletionAsyncExecutor, Clock.systemUTC(), experimentEnrollmentManager);
+    final MessagesManager messagesManager =
+        new MessagesManager(messagesDynamoDb, foundationDbMessageStore,
+            reportMessageManager, messageDeletionAsyncExecutor, Clock.systemUTC());
     final ChangeNumberWaitingPeriods changeNumberWaitingPeriods = new ChangeNumberWaitingPeriods(
         config.getDynamoDbTables().getChangeNumberWaitingPeriods().getTableName(), dynamoDbClient);
     final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager = new ChangeNumberWaitingPeriodManager(
@@ -945,7 +935,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     environment.lifecycle().manage(pushNotificationScheduler);
     environment.lifecycle().manage(provisioningManager);
     environment.lifecycle().manage(disconnectionRequestManager);
-    environment.lifecycle().manage(redisMessageAvailabilityManager);
     environment.lifecycle().manage(currencyManager);
     environment.lifecycle().manage(registrationServiceClient);
     environment.lifecycle().manage(keyTransparencyServiceClient);
@@ -1360,6 +1349,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     provisioningEnvironment.jersey().register(new MetricsApplicationEventListener(TrafficSource.WEBSOCKET, clientReleaseManager));
     provisioningEnvironment.jersey().register(new KeepAliveController());
     provisioningEnvironment.jersey().register(new TimestampResponseFilter());
+
+    WebSocketConnection.registerDroppedErrorHook();
 
     registerExceptionMappers(environment, webSocketEnvironment, provisioningEnvironment);
 
