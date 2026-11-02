@@ -8,6 +8,8 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.Empty;
 import io.grpc.StatusRuntimeException;
 import io.micrometer.core.instrument.Metrics;
+
+import java.time.Clock;
 import java.time.Duration;
 import java.util.UUID;
 import javax.annotation.Nullable;
@@ -20,8 +22,8 @@ import org.whispersystems.textsecuregcm.auth.DisconnectionRequestManager;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
+import org.whispersystems.textsecuregcm.push.NotPushRegisteredException;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
-import org.whispersystems.textsecuregcm.push.PushNotificationScheduler;
 import org.whispersystems.textsecuregcm.push.ReceiptSender;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
@@ -51,8 +53,6 @@ public class MessageDispatcher {
   static final Duration CLOSE_WITH_PENDING_MESSAGES_NOTIFICATION_DELAY = Duration.ofMinutes(1);
   private static final int MESSAGE_PUBLISHER_LIMIT_RATE = 100;
 
-  public static final GetMessagesResponse QUEUE_EMPTY_RESPONSE =
-      GetMessagesResponse.newBuilder().setQueueEmpty(Empty.getDefaultInstance()).build();
   private static final StatusRuntimeException CONFLICTING_STREAM_EXCEPTION =
       GrpcExceptions.streamClosed(GetMessagesStreamClosed.newBuilder()
           .setConflictingStream(Empty.getDefaultInstance())
@@ -64,24 +64,24 @@ public class MessageDispatcher {
   private final MessagesManager messagesManager;
   private final MessageMetrics messageMetrics;
   private final PushNotificationManager pushNotificationManager;
-  private final PushNotificationScheduler pushNotificationScheduler;
   private final ClientReleaseManager clientReleaseManager;
   private final DisconnectionRequestManager disconnectionRequestManager;
+  private final Clock clock;
 
   public MessageDispatcher(final ReceiptSender receiptSender,
       final MessagesManager messagesManager,
       final MessageMetrics messageMetrics,
       final PushNotificationManager pushNotificationManager,
-      final PushNotificationScheduler pushNotificationScheduler,
       final DisconnectionRequestManager disconnectionRequestManager,
-      final ClientReleaseManager clientReleaseManager) {
+      final ClientReleaseManager clientReleaseManager,
+      final Clock clock) {
     this.receiptSender = receiptSender;
     this.messagesManager = messagesManager;
     this.messageMetrics = messageMetrics;
     this.pushNotificationManager = pushNotificationManager;
-    this.pushNotificationScheduler = pushNotificationScheduler;
     this.disconnectionRequestManager = disconnectionRequestManager;
     this.clientReleaseManager = clientReleaseManager;
+    this.clock = clock;
   }
 
   /// Retrieve messages for the device.
@@ -147,7 +147,7 @@ public class MessageDispatcher {
             final MessageProtos.Envelope stripped = envelope.toBuilder().clearEphemeral().build();
             messageMetrics.measureAccountEnvelopeUuidMismatches(account, envelope);
             messageMetrics.measureMessageSent(stripped.getSerializedSize());
-            yield Mono.just(GetMessagesResponse.newBuilder().setEnvelope(stripped).build());
+            yield Mono.just(GetMessagesResponse.newBuilder().setEnvelope(stripped).setServerTimeEpochMillis(clock.millis()).build());
           }
           case MessageStreamEntry.QueueEmpty _ -> {
             pendingAcknowledgementTracker.markEndOfQueue();
@@ -193,19 +193,22 @@ public class MessageDispatcher {
             // Will only emit errors, but those should terminate the stream
             ackCompletions,
             // Emits a queue empty once all messages prior to the queueEmpty signal have been acked
-            pendingAcknowledgementTracker.queueDrained(),
+        pendingAcknowledgementTracker.queueDrained().map(
+            _ -> GetMessagesResponse.newBuilder().setQueueEmpty(Empty.getDefaultInstance()).setServerTimeEpochMillis(clock.millis()).build()),
             // Emit an invalid credentials error if we receive a disconnection request
             disconnectionSignal(account, device, userAgent))
-        .doFinally(_ -> maybeSchedulePush(account, device));
+        .doFinally(_ -> maybeSendNewMessagePushNotification(account, device));
   }
 
-  /// If the device potentially has more messages available, schedule a push notification.
-  private void maybeSchedulePush(final Account account, final Device device) {
+  /// If the device potentially has more messages available, send a push notification.
+  private void maybeSendNewMessagePushNotification(final Account account, final Device device) {
     messagesManager.mayHaveMessages(account.getAccountIdentifier(), device)
         .thenAccept(mayHaveMessages -> {
           if (mayHaveMessages) {
-            pushNotificationScheduler.scheduleDelayedNotification(account, device,
-                CLOSE_WITH_PENDING_MESSAGES_NOTIFICATION_DELAY);
+            try {
+              pushNotificationManager.sendNewMessageNotification(account, device.getId(), true);
+            } catch (NotPushRegisteredException _) {
+            }
           }
         });
   }

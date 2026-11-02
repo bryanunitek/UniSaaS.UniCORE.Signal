@@ -12,6 +12,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.google.protobuf.ByteString;
+import io.grpc.Status;
 import java.io.IOException;
 import java.security.SecureRandom;
 import java.time.Clock;
@@ -25,14 +26,18 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -42,13 +47,15 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.signal.chat.messages.GetMessagesResponse;
 import org.whispersystems.textsecuregcm.auth.DisconnectionRequestManager;
+import org.whispersystems.textsecuregcm.configuration.BulkheadConfiguration;
+import org.whispersystems.textsecuregcm.configuration.CircuitBreakerConfiguration;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
-import org.whispersystems.textsecuregcm.push.PushNotificationScheduler;
 import org.whispersystems.textsecuregcm.push.ReceiptSender;
+import org.whispersystems.textsecuregcm.redis.RedisServerExtension;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
 import org.whispersystems.textsecuregcm.storage.Device;
@@ -66,6 +73,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
+import reactor.test.StepVerifier;
 import reactor.test.publisher.TestPublisher;
 
 @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
@@ -75,7 +83,17 @@ class MessageDispatcherIntegrationTest {
   static final DynamoDbExtension DYNAMO_DB_EXTENSION = new DynamoDbExtension(Tables.MESSAGES);
 
   @RegisterExtension
-  static FoundationDbClusterExtension FOUNDATION_DB_EXTENSION = new FoundationDbClusterExtension(1);
+  static final FoundationDbClusterExtension FOUNDATION_DB_EXTENSION;
+
+  static {
+    final BulkheadConfiguration bulkheadConfiguration = new BulkheadConfiguration();
+    bulkheadConfiguration.setMaxConcurrentCalls(256);
+
+    FOUNDATION_DB_EXTENSION = new FoundationDbClusterExtension(1, new CircuitBreakerConfiguration(), bulkheadConfiguration);
+  }
+
+  @RegisterExtension
+  static final RedisServerExtension REDIS_EXTENSION = RedisServerExtension.builder().build();
 
   private static ExecutorService sharedExecutorService;
   private static ScheduledExecutorService sharedScheduledExecutorService;
@@ -86,6 +104,7 @@ class MessageDispatcherIntegrationTest {
   private Account account;
   private Device device;
   private MessageDispatcher messageDispatcher;
+  private DisconnectionRequestManager disconnectionRequestManager;
 
   private long serialTimestamp = System.currentTimeMillis();
 
@@ -128,6 +147,11 @@ class MessageDispatcherIntegrationTest {
     when(account.getAccountIdentifier()).thenReturn(UUID.randomUUID());
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
 
+    disconnectionRequestManager = new DisconnectionRequestManager(REDIS_EXTENSION.getRedisClient(),
+        Runnable::run,
+        mock(ScheduledExecutorService.class));
+    disconnectionRequestManager.start();
+
     messageDispatcher = new MessageDispatcher(
         mock(ReceiptSender.class),
         new MessagesManager(messagesDynamoDb, foundationDbMessageStore,
@@ -135,9 +159,14 @@ class MessageDispatcherIntegrationTest {
             sharedExecutorService, Clock.systemUTC()),
         new MessageMetrics(),
         mock(PushNotificationManager.class),
-        mock(PushNotificationScheduler.class),
-        mock(DisconnectionRequestManager.class),
-        mock(ClientReleaseManager.class));
+        disconnectionRequestManager,
+        mock(ClientReleaseManager.class),
+        Clock.systemUTC());
+  }
+
+  @AfterEach
+  void tearDown() {
+    disconnectionRequestManager.stop();
   }
 
   @AfterAll
@@ -178,13 +207,14 @@ class MessageDispatcherIntegrationTest {
   }
 
   @Test
-  void testProcessStoredMessagesMultipleSegments() {
+  void testProcessStoredMessagesMultipleSegments() throws ExecutionException, InterruptedException, TimeoutException {
     final int dynamoDbMessageCount = 77;
 
     final List<Envelope> expectedMessages = fillRandomMessages(dynamoDbMessageCount, 0);
     final AtomicInteger remainingMessages = new AtomicInteger(dynamoDbMessageCount);
     final int additionalMessageCount = 67;
 
+    final AtomicReference<Future<List<Envelope>>> additionalMessagesFuture = new AtomicReference<>();
     final Sinks.Many<UUID> acks = Sinks.many().unicast().onBackpressureBuffer();
     final List<Envelope> receivedMessages = messageDispatcher
         .getMessages(true, null, account, device, acks.asFlux())
@@ -193,13 +223,14 @@ class MessageDispatcherIntegrationTest {
         .doOnNext(envelope -> {
           acks.tryEmitNext(UUIDUtil.fromByteString(envelope.getServerGuid()));
           if (remainingMessages.addAndGet(-1) == 60) {
-            sharedExecutorService
-                .submit(() -> expectedMessages.addAll(fillRandomMessages( 0, additionalMessageCount)));
+            additionalMessagesFuture.set(sharedExecutorService.submit(() ->
+                fillRandomMessages(0, additionalMessageCount)));
           }
         })
         .take(dynamoDbMessageCount + additionalMessageCount)
         .collectList()
         .block(Duration.ofSeconds(15));
+    expectedMessages.addAll(additionalMessagesFuture.get().get(15, TimeUnit.SECONDS));
     assertEquals(expectedMessages.size(), receivedMessages.size());
     assertEquals(expectedMessages, receivedMessages);
   }
@@ -222,6 +253,29 @@ class MessageDispatcherIntegrationTest {
 
     assertInstanceOf(IOException.class, thrown.getCause());
     assertTrue(expectedMessages.containsAll(receivedMessages));
+  }
+
+  @Test
+  void testAccountDeletedWhileConnected() {
+    final AciServiceIdentifier aci = new AciServiceIdentifier(account.getAccountIdentifier());
+    final Envelope envelope = generateRandomMessage(UUID.randomUUID()).toBuilder().clearServerGuid().build();
+    final Sinks.Many<UUID> acks = Sinks.many().unicast().onBackpressureBuffer();
+
+    StepVerifier.create(messageDispatcher.getMessages(true, null, account, device, acks.asFlux()))
+        .expectNextMatches(GetMessagesResponse::hasQueueEmpty)
+        // Clearing deletes the watch key, which wakes our stream only if the key exists. Make sure we have written a
+        // watch key by sending a message while we're present to make the interaction with clear more interesting.
+        .then(() -> foundationDbMessageStore.insert(aci, Map.of(device.getId(), envelope)).join())
+        .expectNextMatches(GetMessagesResponse::hasEnvelope)
+        // Emulate an account delete
+        .then(() -> foundationDbMessageStore.clearAll(aci))
+        // Increase the chance that the stream observes the effects of the clear before the disconnection
+        .thenAwait(Duration.ofMillis(1))
+        .then(() -> disconnectionRequestManager.requestDisconnection(aci.uuid(), List.of(device.getId()))
+            .toCompletableFuture().join())
+        .expectErrorSatisfies(throwable ->
+            assertEquals(Status.Code.UNAUTHENTICATED, Status.fromThrowable(throwable).getCode()))
+        .verify(Duration.ofSeconds(5));
   }
 
   private List<Envelope> fillRandomMessages(final int dynamoDbMessageCount, final int foundationDbMessageCount) {
