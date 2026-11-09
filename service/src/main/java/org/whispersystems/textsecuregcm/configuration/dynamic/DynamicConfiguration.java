@@ -47,6 +47,10 @@ public class DynamicConfiguration {
 
   @JsonProperty
   @Valid
+  DynamicNotificationConfiguration notifications = DynamicNotificationConfiguration.DEFAULT;
+
+  @JsonProperty
+  @Valid
   DynamicRegistrationConfiguration registrationConfiguration = new DynamicRegistrationConfiguration(false);
 
   @JsonProperty
@@ -72,6 +76,10 @@ public class DynamicConfiguration {
   @JsonProperty
   @Valid
   private DynamicGrpcAllowListConfiguration grpcAllowList = new DynamicGrpcAllowListConfiguration();
+
+  @JsonProperty
+  @Valid
+  private DynamicGrpcCompressionConfiguration grpcCompression = new DynamicGrpcCompressionConfiguration();
 
   @JsonProperty
   @Valid
@@ -115,6 +123,10 @@ public class DynamicConfiguration {
     return messageDelivery;
   }
 
+  public DynamicNotificationConfiguration getNotificationConfiguration() {
+    return notifications;
+  }
+
   public DynamicRegistrationConfiguration getRegistrationConfiguration() {
     return registrationConfiguration;
   }
@@ -141,6 +153,10 @@ public class DynamicConfiguration {
 
   public DynamicGrpcAllowListConfiguration getGrpcAllowList() {
     return grpcAllowList;
+  }
+
+  public DynamicGrpcCompressionConfiguration getGrpcCompression() {
+    return grpcCompression;
   }
 
   public DynamicOmnibusConfiguration getOmnibus() {

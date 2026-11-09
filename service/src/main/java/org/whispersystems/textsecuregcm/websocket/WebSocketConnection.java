@@ -8,11 +8,11 @@ package org.whispersystems.textsecuregcm.websocket;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.google.common.annotations.VisibleForTesting;
-import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -25,6 +25,7 @@ import javax.annotation.Nullable;
 import org.eclipse.jetty.util.ConstantThrowable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
@@ -33,11 +34,13 @@ import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
 import org.whispersystems.textsecuregcm.push.NotPushRegisteredException;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
+import org.whispersystems.textsecuregcm.push.PushNotificationScheduler;
 import org.whispersystems.textsecuregcm.push.ReceiptSender;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
 import org.whispersystems.textsecuregcm.storage.ConflictingMessageConsumerException;
 import org.whispersystems.textsecuregcm.storage.Device;
+import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.MessageStream;
 import org.whispersystems.textsecuregcm.storage.MessageStreamEntry;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
@@ -58,7 +61,7 @@ import reactor.core.scheduler.Scheduler;
 
 public class WebSocketConnection {
 
-  private static final Counter sendFailuresCounter = Metrics.counter(name(WebSocketConnection.class, "sendFailures"));
+  private static final String SEND_FAILURES_COUNTER_NAME = name(WebSocketConnection.class, "sendFailures");
 
   private static final String NON_SUCCESS_RESPONSE_COUNTER_NAME = name(WebSocketConnection.class,
       "clientNonSuccessResponse");
@@ -77,6 +80,8 @@ public class WebSocketConnection {
   @VisibleForTesting
   static final int MESSAGE_SENDER_MAX_CONCURRENCY = 256;
 
+  private static final Duration CLOSE_WITH_PENDING_MESSAGES_NOTIFICATION_DELAY = Duration.ofMinutes(1);
+
   private static final Logger logger = LoggerFactory.getLogger(WebSocketConnection.class);
   private static final Logger droppedErrorLogger = LoggerFactory.getLogger("droppedError");
 
@@ -84,6 +89,8 @@ public class WebSocketConnection {
   private final MessagesManager messagesManager;
   private final MessageMetrics messageMetrics;
   private final PushNotificationManager pushNotificationManager;
+  private final PushNotificationScheduler pushNotificationScheduler;
+  private final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager;
 
   private final Account authenticatedAccount;
   private final Device authenticatedDevice;
@@ -103,21 +110,25 @@ public class WebSocketConnection {
       final MessagesManager messagesManager,
       final MessageMetrics messageMetrics,
       final PushNotificationManager pushNotificationManager,
+      final PushNotificationScheduler pushNotificationScheduler,
       final Account authenticatedAccount,
       final Device authenticatedDevice,
       final WebSocketClient client,
       final Scheduler messageDeliveryScheduler,
-      final ClientReleaseManager clientReleaseManager) {
+      final ClientReleaseManager clientReleaseManager,
+      final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager) {
 
     this.receiptSender = receiptSender;
     this.messagesManager = messagesManager;
     this.messageMetrics = messageMetrics;
     this.pushNotificationManager = pushNotificationManager;
+    this.pushNotificationScheduler = pushNotificationScheduler;
     this.authenticatedAccount = authenticatedAccount;
     this.authenticatedDevice = authenticatedDevice;
     this.client = client;
     this.messageDeliveryScheduler = messageDeliveryScheduler;
     this.clientReleaseManager = clientReleaseManager;
+    this.dynamicConfigurationManager = dynamicConfigurationManager;
 
     this.messageStream =
         messagesManager.getMessages(authenticatedAccount.getAccountIdentifier(), authenticatedDevice);
@@ -184,9 +195,17 @@ public class WebSocketConnection {
     messagesManager.mayHaveMessages(authenticatedAccount.getAccountIdentifier(), authenticatedDevice)
         .thenAccept(mayHaveMessages -> {
           if (mayHaveMessages) {
-            try {
-              pushNotificationManager.sendNewMessageNotification(authenticatedAccount, authenticatedDevice.getId(), true);
-            } catch (NotPushRegisteredException _) {
+            if (dynamicConfigurationManager.getConfiguration().getNotificationConfiguration().sendRemainingMessagesNotificationImmediately()) {
+              try {
+                pushNotificationManager.sendNewMessageNotification(authenticatedAccount,
+                    authenticatedDevice.getId(),
+                    true);
+              } catch (NotPushRegisteredException _) {
+              }
+            } else {
+              pushNotificationScheduler.scheduleDelayedNotification(authenticatedAccount,
+                  authenticatedDevice,
+                  CLOSE_WITH_PENDING_MESSAGES_NOTIFICATION_DELAY);
             }
           }
         });
@@ -226,7 +245,8 @@ public class WebSocketConnection {
             List.of(HeaderUtils.getTimestampHeader()), body)
         .whenComplete((ignored, throwable) -> {
           if (throwable != null) {
-            sendFailuresCounter.increment();
+            Metrics.counter(SEND_FAILURES_COUNTER_NAME, EXCEPTION_TYPE_TAG, throwable.getClass().getSimpleName())
+                    .increment();
           } else {
             messageMetrics.measureOutgoingMessageLatency(serverTimestamp,
                 MessageMetrics.WEBSOCKET_CHANNEL,

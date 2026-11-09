@@ -33,10 +33,11 @@ import io.lettuce.core.metrics.MicrometerOptions;
 import io.lettuce.core.resource.ClientResources;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.binder.jvm.ExecutorServiceMetrics;
-import io.netty.channel.DefaultEventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.local.LocalAddress;
+import io.netty.channel.local.LocalIoHandler;
 import io.netty.channel.local.LocalServerChannel;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
@@ -176,6 +177,7 @@ import org.whispersystems.textsecuregcm.grpc.ErrorMappingInterceptor;
 import org.whispersystems.textsecuregcm.grpc.ExternalServiceDefinitions;
 import org.whispersystems.textsecuregcm.grpc.GroupSendTokenUtil;
 import org.whispersystems.textsecuregcm.grpc.GrpcAllowListInterceptor;
+import org.whispersystems.textsecuregcm.grpc.GrpcCompressionInterceptor;
 import org.whispersystems.textsecuregcm.grpc.KeyTransparencyGrpcService;
 import org.whispersystems.textsecuregcm.grpc.KeysAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.KeysGrpcService;
@@ -184,6 +186,7 @@ import org.whispersystems.textsecuregcm.grpc.MessageDispatcher;
 import org.whispersystems.textsecuregcm.grpc.MessagesAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.MessagesGrpcService;
 import org.whispersystems.textsecuregcm.grpc.MetricServerInterceptor;
+import org.whispersystems.textsecuregcm.grpc.MetricServerStreamTracer;
 import org.whispersystems.textsecuregcm.grpc.OneTimeDonationsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.PaymentsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.ProductConfigurationGrpcService;
@@ -193,11 +196,14 @@ import org.whispersystems.textsecuregcm.grpc.RemoteConfigurationGrpcService;
 import org.whispersystems.textsecuregcm.grpc.RequestAttributesInterceptor;
 import org.whispersystems.textsecuregcm.grpc.SubscriptionsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.ValidatingInterceptor;
+import org.whispersystems.textsecuregcm.grpc.net.H2ConnectionFactory;
 import org.whispersystems.textsecuregcm.grpc.net.ManagedEventLoopGroup;
 import org.whispersystems.textsecuregcm.grpc.net.ManagedGrpcServer;
 import org.whispersystems.textsecuregcm.grpc.net.OmnibusH2Server;
 import org.whispersystems.textsecuregcm.grpc.net.OmnibusRouter;
+import org.whispersystems.textsecuregcm.grpc.net.PooledH2ConnectionFactory;
 import org.whispersystems.textsecuregcm.grpc.net.SniMapper;
+import org.whispersystems.textsecuregcm.grpc.net.UnpooledH2ConnectionFactory;
 import org.whispersystems.textsecuregcm.grpc.validators.ValidatorUtils;
 import org.whispersystems.textsecuregcm.jetty.JettyHttpConfigurationCustomizer;
 import org.whispersystems.textsecuregcm.keytransparency.KeyTransparencyServiceClient;
@@ -726,7 +732,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     ScheduledExecutorService messagePollExecutor = ScheduledExecutorServiceBuilder.of(environment, "messagePollExecutor").threads(1).build();
     ScheduledExecutorService provisioningWebsocketTimeoutExecutor = ScheduledExecutorServiceBuilder.of(environment, "provisioningWebsocketTimeout").threads(1).build();
 
-    final ManagedEventLoopGroup<NioEventLoopGroup> dnsResolutionEventLoopGroup = new ManagedEventLoopGroup<>(new NioEventLoopGroup());
+    final ManagedEventLoopGroup<MultiThreadIoEventLoopGroup> dnsResolutionEventLoopGroup =
+        new ManagedEventLoopGroup<>(new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory()));
     final DnsNameResolver cloudflareDnsResolver = new DnsNameResolverBuilder(dnsResolutionEventLoopGroup.getEventLoopGroup().next())
         .resolvedAddressTypes(ResolvedAddressTypes.IPV6_PREFERRED)
         .completeOncePreferredResolved(false)
@@ -833,7 +840,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     APNSender apnSender = new APNSender(apnSenderExecutor, Clock.systemUTC(), config.getApnConfiguration());
     FcmSender fcmSender = new FcmSender(fcmSenderExecutor, config.getFcmConfiguration().credentials().value());
     PushNotificationScheduler pushNotificationScheduler = new PushNotificationScheduler(pushSchedulerCluster,
-        apnSender, fcmSender, accountsManager, 0, 0);
+        apnSender, fcmSender, accountsManager, 0, 0, retryExecutor);
     PushNotificationManager pushNotificationManager =
         new PushNotificationManager(accountsManager, apnSender, fcmSender, pushNotificationScheduler);
     RateLimiters rateLimiters = RateLimiters.create(dynamicConfigurationManager, rateLimitersCluster, retryExecutor);
@@ -1097,6 +1104,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final ErrorMappingInterceptor errorMappingInterceptor = new ErrorMappingInterceptor();
     final ErrorConformanceInterceptor errorConformanceInterceptor = new ErrorConformanceInterceptor();
     final GrpcAllowListInterceptor grpcAllowListInterceptor = new GrpcAllowListInterceptor(dynamicConfigurationManager);
+    final GrpcCompressionInterceptor grpcCompressionInterceptor = new GrpcCompressionInterceptor(dynamicConfigurationManager);
     final RequestAttributesInterceptor requestAttributesInterceptor = new RequestAttributesInterceptor();
 
     final ValidatingInterceptor validatingInterceptor = new ValidatingInterceptor();
@@ -1112,7 +1120,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final GroupSendTokenUtil groupSendTokenUtil = new GroupSendTokenUtil(groupZkSecretParams, Clock.systemUTC());
     final MessageMetrics messageMetrics = new MessageMetrics();
     final MessageDispatcher messageDispatcher = new MessageDispatcher(receiptSender, messagesManager, messageMetrics,
-        pushNotificationManager, disconnectionRequestManager, clientReleaseManager, Clock.systemUTC());
+        pushNotificationManager, pushNotificationScheduler, disconnectionRequestManager, clientReleaseManager, Clock.systemUTC());
 
     final CertificateGenerator certificateGenerator =
         new CertificateGenerator(config.getDeliveryCertificate().certificate(),
@@ -1153,6 +1161,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             validatingInterceptor,
             errorMappingInterceptor,
             errorConformanceInterceptor,
+            grpcCompressionInterceptor,
             grpcAllowListInterceptor,
             remoteDeprecationFilter,
             metricServerInterceptor,
@@ -1185,6 +1194,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             validatingInterceptor,
             errorMappingInterceptor,
             errorConformanceInterceptor,
+            grpcCompressionInterceptor,
             grpcAllowListInterceptor,
             remoteDeprecationFilter,
             metricServerInterceptor,
@@ -1196,15 +1206,18 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     verifyServiceAuth(authenticatedServices, Auth.AUTH_ONLY_AUTHENTICATED);
     verifyServiceAuth(unauthenticatedServices, Auth.AUTH_ONLY_ANONYMOUS);
 
-    final ManagedEventLoopGroup<DefaultEventLoopGroup> omnibusLocalEventLoopGroup = new ManagedEventLoopGroup<>(new DefaultEventLoopGroup());
-    final ManagedEventLoopGroup<NioEventLoopGroup> omnibusNioEventLoopGroup = new ManagedEventLoopGroup<>(new NioEventLoopGroup());
+    final ManagedEventLoopGroup<MultiThreadIoEventLoopGroup> omnibusLocalEventLoopGroup =
+        new ManagedEventLoopGroup<>(new MultiThreadIoEventLoopGroup(LocalIoHandler.newFactory()));
+    final ManagedEventLoopGroup<MultiThreadIoEventLoopGroup> omnibusNioEventLoopGroup =
+        new ManagedEventLoopGroup<>(new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory()));
     final LocalAddress grpcLocalAddress = new LocalAddress("grpc");
     final ServerBuilder<?> serverBuilder = NettyServerBuilder
         .forAddress(grpcLocalAddress)
         .channelType(LocalServerChannel.class)
         .bossEventLoopGroup(omnibusLocalEventLoopGroup.getEventLoopGroup())
         .workerEventLoopGroup(omnibusLocalEventLoopGroup.getEventLoopGroup())
-        .executor(ManagedExecutors.newVirtualThreadPerTaskExecutor("managed-grpc-virtual-thread", environment));
+        .executor(ManagedExecutors.newVirtualThreadPerTaskExecutor("managed-grpc-virtual-thread", environment))
+        .addStreamTracerFactory(new MetricServerStreamTracer.Factory());
     authenticatedServices.forEach(serverBuilder::addService);
     unauthenticatedServices.forEach(serverBuilder::addService);
     final ManagedGrpcServer localGrpcServer = new ManagedGrpcServer(serverBuilder.build());
@@ -1214,10 +1227,13 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
 
     final SocketAddress websocketAddress =
         new InetSocketAddress(config.getGrpc().websocketAddress(), config.getGrpc().websocketPort());
+    final H2ConnectionFactory grpcH2ConnectionFactory = new PooledH2ConnectionFactory(grpcLocalAddress,
+        omnibusLocalEventLoopGroup.getEventLoopGroup());
+    final H2ConnectionFactory websocketH2ConnectionFactory = new UnpooledH2ConnectionFactory(websocketAddress, omnibusNioEventLoopGroup.getEventLoopGroup());
     final OmnibusRouter omnibusRouter = new OmnibusRouter(Map.of(
-        websocketServletPath, websocketAddress,
-        provisioningWebsocketServletPath, websocketAddress),
-        grpcLocalAddress);
+        websocketServletPath, websocketH2ConnectionFactory,
+        provisioningWebsocketServletPath, websocketH2ConnectionFactory),
+        grpcH2ConnectionFactory);
     @Nullable final Mapping<String, SslContext> sniMapping = config.getGrpc().h2c()
         ? null
         : SniMapper.buildSniMapping(config.getTlsKeyStoreConfiguration().path(),
@@ -1226,7 +1242,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final OmnibusH2Server omnibusH2Server = new OmnibusH2Server(
         sniMapping,
         omnibusNioEventLoopGroup.getEventLoopGroup(),
-        omnibusLocalEventLoopGroup.getEventLoopGroup(),
         new InetSocketAddress(config.getGrpc().bindAddress(), config.getGrpc().port()), omnibusRouter,
         () -> dynamicConfigurationManager.getConfiguration().getOmnibus(),
         config.getGrpc().idleTimeout());
@@ -1279,7 +1294,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     webSocketEnvironment.setConnectListener(
         new AuthenticatedConnectListener(accountsManager, receiptSender, messagesManager, messageMetrics, pushNotificationManager,
             pushNotificationScheduler, disconnectionRequestManager,
-            messageDeliveryScheduler, asnInfoProviderSupplier, clientReleaseManager, experimentEnrollmentManager
+            messageDeliveryScheduler, asnInfoProviderSupplier, clientReleaseManager, dynamicConfigurationManager
         ));
     webSocketEnvironment.jersey().register(new RateLimitByIpFilter(rateLimiters));
     webSocketEnvironment.jersey().register(new RequestStatisticsFilter(TrafficSource.WEBSOCKET));
